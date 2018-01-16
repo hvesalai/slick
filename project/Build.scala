@@ -12,7 +12,7 @@ import com.novocode.ornate.sbtplugin.OrnatePlugin.autoImport._
 
 object SlickBuild extends Build {
 
-  val slickVersion = "3.2.2"
+  val slickVersion = "3.2.2-TMNOW20180302"
   val binaryCompatSlickVersion = "3.2.1" // Slick base version for binary compatibility checks
   val scalaVersions = Seq("2.11.8", "2.12.4")
 
@@ -117,10 +117,11 @@ object SlickBuild extends Build {
     ),
     logBuffered := false,
     repoKind := (if (version.value.trim.endsWith("SNAPSHOT")) "snapshots" else "releases"),
-    publishTo := (repoKind.value match {
+    publishTo := Some("Artifactory Realm" at "https://trademarknow.jfrog.io/trademarknow/trademarknow-ext"),
+/*    publishTo := (repoKind.value match {
       case "snapshots" => Some("snapshots" at "https://oss.sonatype.org/content/repositories/snapshots")
       case "releases" =>  Some("releases"  at "https://oss.sonatype.org/service/local/staging/deploy/maven2")
-    }),
+    }), */
     publishMavenStyle := true,
     publishArtifact in Test := false,
     pomIncludeRepository := { _ => false },
