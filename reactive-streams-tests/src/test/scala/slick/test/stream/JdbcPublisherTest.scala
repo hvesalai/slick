@@ -1,8 +1,9 @@
 package slick.test.stream
 
-import scala.concurrent.Await
-import scala.concurrent.duration.Duration
 import scala.util.control.NonFatal
+
+import cats.effect.IO
+import cats.effect.unsafe.implicits.global
 
 import slick.jdbc.{H2Profile, JdbcProfile}
 
@@ -13,12 +14,12 @@ class JdbcPublisherTest extends RelationalPublisherTest[JdbcProfile](H2Profile, 
 
 
   def createDB = {
-    val db = Database.forURL("jdbc:h2:mem:DatabasePublisherTest", driver = "org.h2.Driver", keepAliveConnection = true)
+    val (db, _) = Database.forURL[IO]("jdbc:h2:mem:DatabasePublisherTest", driver = "org.h2.Driver", keepAliveConnection = true).allocated.unsafeRunSync()
     // Wait until the database has been initialized and can process queries:
     try {
-      Await.result(db.run(sql"SELECT 1".as[Int]), Duration.Inf)
+      db.run(sql"SELECT 1".as[Int]).unsafeRunSync()
     } catch {
-      case NonFatal(ex) =>
+      case NonFatal(_) =>
     }
     db
   }

@@ -1,10 +1,11 @@
 package slick.jdbc
 
-import java.sql.{PreparedStatement, ResultSet, Statement}
+import java.sql.{PreparedStatement, ResultSet, Savepoint, SQLFeatureNotSupportedException, Statement}
 
 import scala.collection.mutable.Builder
 import scala.language.existentials
 import scala.util.control.NonFatal
+import scala.util.{Failure, Success}
 import slick.SlickException
 import slick.ast.*
 import slick.ast.ColumnOption.PrimaryKey
@@ -15,7 +16,6 @@ import slick.lifted.{CompiledStreamingExecutable, FlatShapeLevel, Query, Shape}
 import slick.relational.{CompiledMapping, ResultConverter}
 import slick.sql.{FixedSqlAction, FixedSqlStreamingAction, SqlActionComponent}
 import slick.util.{ignoreFollowOnError, DumpInfo, SQLBuilder}
-import slick.compat.collection.*
 
 
 trait JdbcActionComponent extends SqlActionComponent { self: JdbcProfile =>
@@ -35,26 +35,6 @@ trait JdbcActionComponent extends SqlActionComponent { self: JdbcProfile =>
     }
   }
 
-  protected object StartTransaction extends SynchronousDatabaseAction[Unit, NoStream, JdbcBackend#JdbcActionContext, JdbcBackend#JdbcStreamingActionContext, Effect] {
-    def run(ctx: JdbcBackend#JdbcActionContext): Unit = {
-      ctx.pin
-      ctx.session.startInTransaction
-    }
-    def getDumpInfo = DumpInfo(name = "StartTransaction")
-  }
-
-  protected object Commit extends SynchronousDatabaseAction[Unit, NoStream, JdbcBackend#JdbcActionContext, JdbcBackend#JdbcStreamingActionContext, Effect] {
-    def run(ctx: JdbcBackend#JdbcActionContext): Unit =
-      try ctx.session.endInTransaction(ctx.session.conn.commit()) finally ctx.unpin
-    def getDumpInfo = DumpInfo(name = "Commit")
-  }
-
-  protected object Rollback extends SynchronousDatabaseAction[Unit, NoStream, JdbcBackend#JdbcActionContext, JdbcBackend#JdbcStreamingActionContext, Effect] {
-    def run(ctx: JdbcBackend#JdbcActionContext): Unit =
-      try ctx.session.endInTransaction(ctx.session.conn.rollback()) finally ctx.unpin
-    def getDumpInfo = DumpInfo(name = "Rollback")
-  }
-
   protected class PushStatementParameters(p: JdbcBackend.StatementParameters) extends SynchronousDatabaseAction[Unit, NoStream, JdbcBackend#JdbcActionContext, JdbcBackend#JdbcStreamingActionContext, Effect] {
     def run(ctx: JdbcBackend#JdbcActionContext): Unit = ctx.pushStatementParameters(p)
     def getDumpInfo = DumpInfo(name = "PushStatementParameters", mainInfo = p.toString)
@@ -65,15 +45,41 @@ trait JdbcActionComponent extends SqlActionComponent { self: JdbcProfile =>
     def getDumpInfo = DumpInfo(name = "PopStatementParameters")
   }
 
-  protected class SetTransactionIsolation(ti: Int) extends SynchronousDatabaseAction[Int, NoStream, JdbcBackend#JdbcActionContext, JdbcBackend#JdbcStreamingActionContext, Effect] {
-    def run(ctx: JdbcBackend#JdbcActionContext): Int = {
-      val c = ctx.session.conn
-      val old = c.getTransactionIsolation
-      c.setTransactionIsolation(ti)
-      old
+  /** Create an anonymous savepoint on the current connection.
+    *
+    * The action must be run inside a transaction (i.e. wrapped with `.transactionally`); calling
+    * it outside a transaction will cause the underlying JDBC driver to throw an exception.
+    * The typical pattern is to use [[JdbcActionExtensionMethods.withSavepoint]] instead of
+    * managing savepoints manually. */
+  val createSavepoint: DBIOAction[Savepoint, NoStream, Effect.Transactional] =
+    new SynchronousDatabaseAction[Savepoint, NoStream, JdbcBackend#JdbcActionContext, JdbcBackend#JdbcStreamingActionContext, Effect.Transactional] {
+      def run(ctx: JdbcBackend#JdbcActionContext): Savepoint = ctx.connection.setSavepoint()
+      def getDumpInfo = DumpInfo(name = "CreateSavepoint")
     }
-    def getDumpInfo = DumpInfo(name = "SetTransactionIsolation")
-  }
+
+  /** Release (discard) a savepoint, signalling that the enclosed operations succeeded.
+    *
+    * If the database does not support `releaseSavepoint` (e.g. Oracle, SQL Server), the call is
+    * silently ignored — the savepoint is discarded automatically when the surrounding transaction
+    * commits, so skipping the explicit release has no effect on correctness.
+    *
+    * @see [[createSavepoint]], [[JdbcActionExtensionMethods.withSavepoint]] */
+  def releaseSavepoint(sp: Savepoint): DBIOAction[Unit, NoStream, Effect.Transactional] =
+    new SynchronousDatabaseAction[Unit, NoStream, JdbcBackend#JdbcActionContext, JdbcBackend#JdbcStreamingActionContext, Effect.Transactional] {
+      def run(ctx: JdbcBackend#JdbcActionContext): Unit =
+        try ctx.connection.releaseSavepoint(sp)
+        catch { case _: SQLFeatureNotSupportedException => () }
+      def getDumpInfo = DumpInfo(name = "ReleaseSavepoint")
+    }
+
+  /** Roll back to a savepoint, undoing all changes made since the savepoint was created.
+    *
+    * @see [[createSavepoint]], [[JdbcActionExtensionMethods.withSavepoint]] */
+  def rollbackToSavepoint(sp: Savepoint): DBIOAction[Unit, NoStream, Effect.Transactional] =
+    new SynchronousDatabaseAction[Unit, NoStream, JdbcBackend#JdbcActionContext, JdbcBackend#JdbcStreamingActionContext, Effect.Transactional] {
+      def run(ctx: JdbcBackend#JdbcActionContext): Unit = ctx.connection.rollback(sp)
+      def getDumpInfo = DumpInfo(name = "RollbackToSavepoint")
+    }
 
   class JdbcActionExtensionMethods[E <: Effect, R, S <: NoStream](a: DBIOAction[R, S, E]) {
 
@@ -81,25 +87,47 @@ trait JdbcActionComponent extends SqlActionComponent { self: JdbcProfile =>
       * presence of error handling combinators. If multiple `transactionally` combinators are
       * nested, only the outermost one will be backed by an actual database transaction. Depending
       * on the outcome of running the Action it surrounds, the transaction is committed if the
-      * wrapped Action succeeds, or rolled back if the wrapped Action fails. When called on a
-      * [[slick.dbio.SynchronousDatabaseAction]], this combinator gets fused into the
-      * action. */
-    def transactionally: DBIOAction[R, S, E with Effect.Transactional] = SynchronousDatabaseAction.fuseUnsafe(
-      StartTransaction.andThen(a).cleanUp(eo => if(eo.isEmpty) Commit else Rollback)(DBIO.sameThreadExecutionContext)
-        .asInstanceOf[DBIOAction[R, S, E with Effect.Transactional]]
-    )
+      * wrapped Action succeeds, or rolled back if the wrapped Action fails or the fiber is
+      * cancelled. */
+    def transactionally: DBIOAction[R, S, E with Effect.Transactional] =
+      TransactionalAction[R, S, E with Effect.Transactional](a, None)
 
-    /** Run this Action with the specified transaction isolation level. This should be used around
-      * the outermost `transactionally` Action. The semantics of using it inside a transaction are
-      * database-dependent. It does not create a transaction by itself but it pins the session. */
-    def withTransactionIsolation(ti: TransactionIsolation): DBIOAction[R, S, E] = {
-      val isolated =
-        (new SetTransactionIsolation(ti.intValue)).flatMap(old => a.andFinally(new SetTransactionIsolation(old)))(DBIO.sameThreadExecutionContext)
-      val fused =
-        if(a.isInstanceOf[SynchronousDatabaseAction[?, ?, ?, ?, ?]]) SynchronousDatabaseAction.fuseUnsafe(isolated)
-        else isolated
-      fused.withPinnedSession
-    }
+    /** Run this Action transactionally with the specified transaction isolation level.
+      * If multiple `transactionally` combinators are nested, only the outermost one controls the
+      * real database transaction; inner isolation-level requests are ignored. The isolation level
+      * is applied atomically with `setAutoCommit(false)` when the connection is first acquired for
+      * the transaction. */
+    def transactionally(ti: TransactionIsolation): DBIOAction[R, S, E with Effect.Transactional] =
+      TransactionalAction[R, S, E with Effect.Transactional](a, Some(ti.intValue))
+
+    /** Run this Action within a savepoint.
+      *
+      * A savepoint allows partial rollback within a transaction: if this action fails, all changes
+      * made since the savepoint was set are rolled back, but the surrounding transaction can still
+      * be committed. If the action succeeds, the savepoint is released.
+      *
+      * The action is automatically wrapped with `.transactionally` to ensure a database
+      * transaction is active; if already inside a transaction, the existing transaction is reused
+      * (the outermost `.transactionally` wins).
+      *
+      * Example:
+      * {{{
+      * val action = (
+      *   for {
+      *     _ <- users += alice
+      *     _ <- (users += duplicate).withSavepoint  // rolls back only this insert on failure
+      *     _ <- users += bob
+      *   } yield ()
+      * ).transactionally
+      * }}}
+      */
+    def withSavepoint: DBIOAction[R, NoStream, E with Effect.Transactional] =
+      createSavepoint.flatMap { sp =>
+        a.asTry.flatMap {
+          case Success(r) => releaseSavepoint(sp).andThen(DBIO.successful(r))
+          case Failure(e) => rollbackToSavepoint(sp).andThen(DBIO.failed(e))
+        }
+      }.transactionally
 
     /** Run this Action with the given statement parameters. Any unset parameter will use the
       * current value. The following parameters can be set:
@@ -118,8 +146,8 @@ trait JdbcActionComponent extends SqlActionComponent { self: JdbcProfile =>
                                 rsHoldability: ResultSetHoldability = null,
                                 statementInit: Statement => Unit = null,
                                 fetchSize: Int = 0): DBIOAction[R, S, E] =
-      (new PushStatementParameters(JdbcBackend.StatementParameters(rsType, rsConcurrency, rsHoldability, statementInit, fetchSize))).
-        andThen(a).andFinally(PopStatementParameters)
+      ((new PushStatementParameters(JdbcBackend.StatementParameters(rsType, rsConcurrency, rsHoldability, statementInit, fetchSize))).
+        andThen(a).andFinally(PopStatementParameters)).withPinnedSession
   }
 
   ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -135,7 +163,7 @@ trait JdbcActionComponent extends SqlActionComponent { self: JdbcProfile =>
     new StreamingQueryActionExtensionMethods[R, T](tree, param)
 
   class MutatingResultAction[T](rsm: ResultSetMapping, elemType: Type, collectionType: CollectionType, sql: String, param: Any, sendEndMarker: Boolean) extends SynchronousDatabaseAction[Nothing, Streaming[ResultSetMutator[T]], JdbcBackend#JdbcActionContext, JdbcBackend#JdbcStreamingActionContext, Effect] with ProfileAction[Nothing, Streaming[ResultSetMutator[T]], Effect] { streamingAction =>
-    class Mutator(val prit: PositionedResultIterator[T], val bufferNext: Boolean, val inv: QueryInvokerImpl[T]) extends ResultSetMutator[T] {
+    class Mutator(val prit: PositionedResultIterator[T], val inv: QueryInvokerImpl[T]) extends ResultSetMutator[T] {
       val pr = prit.pr
       val rs = pr.rs
       var current: T = _
@@ -194,7 +222,6 @@ trait JdbcActionComponent extends SqlActionComponent { self: JdbcProfile =>
         val inv = createQueryInvoker[T](rsm, param, sql)
         new Mutator(
           inv.results(0, defaultConcurrency = invokerMutateConcurrency, defaultType = invokerMutateType)(ctx.session).getOrElse(throw new NoSuchElementException),
-          ctx.bufferNext,
           inv)
       }
       mu.emitStream(ctx, limit)
@@ -654,16 +681,22 @@ trait JdbcActionComponent extends SqlActionComponent { self: JdbcProfile =>
         def f: SingleInsertOrUpdateResult =
           if(useServerSideUpsert) nativeUpsert(value, sql.head)(ctx.session) else emulate(value, sql(0), sql(1), sql(2))(ctx.session)
         if(useTransactionForUpsert) {
-          ctx.session.startInTransaction
+          val conn = ctx.session.conn
+          val wasAutoCommit = conn.getAutoCommit
+          if(wasAutoCommit) conn.setAutoCommit(false)
           var done = false
           try {
             val res = f
             done = true
-            ctx.session.endInTransaction(ctx.session.conn.commit())
+            conn.commit()
+            if(wasAutoCommit) conn.setAutoCommit(true)
             res
           } finally {
             if(!done)
-              try ctx.session.endInTransaction(ctx.session.conn.rollback()) catch ignoreFollowOnError
+              try {
+                conn.rollback()
+                if(wasAutoCommit) conn.setAutoCommit(true)
+              } catch { case scala.util.control.NonFatal(_) => () }
           }
         } else f
       }

@@ -1,7 +1,5 @@
 package slick.test.stream
 
-import scala.concurrent.ExecutionContext
-
 import slick.memory.MemoryProfile
 
 
@@ -9,5 +7,5 @@ class HeapPublisherTest extends RelationalPublisherTest[MemoryProfile](MemoryPro
 
   import profile.api.*
 
-  def createDB = Database(ExecutionContext.global)
+  def createDB = Database()
 }

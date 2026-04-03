@@ -8,7 +8,7 @@ object Cookbook {
    
     //#imports22
     import slick.collection.heterogeneous._
-    import slick.collection.heterogeneous.syntax._
+    // import slick.collection.heterogeneous.syntax._
     //#imports22
     
     //#example22

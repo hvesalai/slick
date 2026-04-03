@@ -5,9 +5,9 @@ import sbt.Keys.scalaVersion
 object Dependencies {
   val scala212 = "2.12.21"
   val scala213 = "2.13.18"
-  val scala3 = "3.3.7"
+  val scala3 = "3.8.3"
 
-  val scalaVersions = Seq(scala212, scala213, scala3) // When updating these also update ci.yml and .mergify.yml
+  val scalaVersions = Seq(scala213, scala3) // When updating these also update ci.yml and .mergify.yml
 
   val slf4j = "org.slf4j" % "slf4j-api" % "2.0.17"
   val typesafeConfig = "com.typesafe" % "config" % "1.4.6"
@@ -15,16 +15,14 @@ object Dependencies {
   val reactiveStreams = "org.reactivestreams" % "reactive-streams" % reactiveStreamsVersion
   val reactiveStreamsTCK = "org.reactivestreams" % "reactive-streams-tck" % reactiveStreamsVersion
 
-  val scalaCollectionCompat = Def.setting {
-    CrossVersion.partialVersion(scalaVersion.value) match {
-      case Some((2, n)) if n == 12 =>
-        Seq("org.scala-lang.modules" %% "scala-collection-compat" % "2.14.0")
-      case _ =>
-        Seq.empty
-    }
-  }
+  val catsEffect = "org.typelevel" %% "cats-effect" % "3.6.1"
+  val fs2Core    = "co.fs2"        %% "fs2-core"    % "3.12.0"
+  val fs2ReactiveStreams = "co.fs2" %% "fs2-reactive-streams" % "3.12.0"
+  val munitCatsEffect = "org.typelevel" %% "munit-cats-effect" % "2.1.0"
 
-  def mainDependencies = Seq(slf4j, typesafeConfig, reactiveStreams)
+  val scalaCollectionCompat = Def.setting { Seq.empty[ModuleID] }
+
+  def mainDependencies = Seq(slf4j, typesafeConfig, catsEffect, fs2Core)
 
   val junit = Seq(
     "junit" % "junit-dep" % "4.11",

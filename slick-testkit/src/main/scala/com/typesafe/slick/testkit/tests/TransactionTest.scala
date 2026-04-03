@@ -64,14 +64,45 @@ class TransactionTest extends AsyncTest[JdbcTestDB] {
     } andThen { ifCap(tcap.transactionIsolation) {
       (for {
         ti1 <- getTI
+        // transactionally(ReadUncommitted) sets the isolation level for the transaction
         _ <- (for {
           _ <- getTI.map(_ should(_ >= TransactionIsolation.ReadUncommitted.intValue))
-          _ <- getTI.withTransactionIsolation(TransactionIsolation.Serializable).map(_ should(_ >= TransactionIsolation.Serializable.intValue))
+        } yield ()).transactionally(TransactionIsolation.ReadUncommitted)
+        // transactionally(Serializable) sets the isolation level for the transaction
+        _ <- (for {
+          _ <- getTI.map(_ should(_ >= TransactionIsolation.Serializable.intValue))
+        } yield ()).transactionally(TransactionIsolation.Serializable)
+        // nested transactionally: outer isolation level wins, inner is ignored
+        _ <- (for {
           _ <- getTI.map(_ should(_ >= TransactionIsolation.ReadUncommitted.intValue))
-        } yield ()).withTransactionIsolation(TransactionIsolation.ReadUncommitted)
+          _ <- (for {
+            // still ReadUncommitted (outer wins), not Serializable
+            _ <- getTI.map(_ should(_ >= TransactionIsolation.ReadUncommitted.intValue))
+          } yield ()).transactionally(TransactionIsolation.Serializable)
+        } yield ()).transactionally(TransactionIsolation.ReadUncommitted)
+        // isolation level is back to default after all transactions
         _ <- getTI.map(_ shouldBe ti1)
       } yield ()).withPinnedSession
-    }}
+    }} andThen { // savepoints
+      (for {
+        _ <- ts += 10
+        _ <- ts.to[Set].result.map(_ shouldBe Set(2, 3, 5, 6, 10))
+        // withSavepoint: successful inner action — savepoint released, row stays
+        _ <- (ts += 11).withSavepoint
+        _ <- ts.to[Set].result.map(_ shouldBe Set(2, 3, 5, 6, 10, 11))
+        // withSavepoint: failed inner action — rolled back to savepoint, surrounding tx continues
+        _ <- (for {
+          _ <- ts += 12
+          _ = throw new ExpectedException
+        } yield ()).withSavepoint.failed.map(_ should (_.isInstanceOf[ExpectedException]))
+        _ <- ts.to[Set].result.map(_ shouldBe Set(2, 3, 5, 6, 10, 11))
+        // direct createSavepoint / rollbackToSavepoint
+        sp <- createSavepoint
+        _ <- ts += 13
+        _ <- rollbackToSavepoint(sp)
+        _ <- ts.to[Set].result.map(_ shouldBe Set(2, 3, 5, 6, 10, 11))
+      } yield ()).transactionally
+    }
   }
 }
 

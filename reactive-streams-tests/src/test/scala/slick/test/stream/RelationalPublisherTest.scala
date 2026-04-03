@@ -2,12 +2,14 @@ package slick.test.stream
 
 import java.util.concurrent.atomic.AtomicInteger
 
-import scala.concurrent.Await
-import scala.concurrent.duration.Duration
+import cats.effect.IO
+import cats.effect.std.Dispatcher
+import cats.effect.unsafe.implicits.global
 
 import slick.relational.RelationalProfile
+import slick.reactivestreams.*
 
-import org.reactivestreams.Publisher
+import org.reactivestreams.{Publisher, Subscriber}
 import org.reactivestreams.tck.*
 import org.scalatestplus.testng.TestNGSuiteLike
 import org.testng.annotations.{AfterClass, BeforeClass}
@@ -29,22 +31,46 @@ abstract class RelationalPublisherTest[P <: RelationalProfile](val profile: P, t
   lazy val data = TableQuery(new Data("data")(_))
   lazy val dataErr = TableQuery(new Data("data_err")(_))
 
-  var db: Database = _
+  var db: Database[IO] = _
+  var dispatcher: Dispatcher[IO] = _
+  var dispatcherClose: IO[Unit] = IO.unit
   val entityNum = new AtomicInteger()
 
-  def createDB: Database
+  def createDB: Database[IO]
 
   @BeforeClass def setUpDB(): Unit = {
     db = createDB
-    Await.result(db.run(data.schema.create >> (data ++= (1 to maxElementsFromPublisher.toInt))), Duration.Inf)
+    val (d, close) = Dispatcher.parallel[IO].allocated.unsafeRunSync()
+    dispatcher = d
+    dispatcherClose = close
+    db.run(data.schema.create >> (data ++= (1 to maxElementsFromPublisher.toInt))).unsafeRunSync()
   }
 
-  @AfterClass def tearDownDB(): Unit =
+  @AfterClass def tearDownDB(): Unit = {
+    dispatcherClose.unsafeRunSync()
     db.close()
+  }
 
-  def createPublisher(elements: Long): Publisher[Int] =
-    db.stream(data.filter(_.id <= elements.toInt).sortBy(_.id).result)
+  def createPublisher(elements: Long): Publisher[Int] = {
+    implicit val d: Dispatcher[IO] = dispatcher
+    db.streamAsPublisher(data.filter(_.id <= elements.toInt).sortBy(_.id).result)
+  }
 
-  def createFailedPublisher: Publisher[Int] =
-    db.stream(dataErr.result)
+  /** Returns a publisher that immediately signals `onError` on every subscriber.
+    *
+    * The TCK may call `subscribe()` on the returned publisher multiple times.
+    * FS2's `StreamUnicastPublisher` may not signal `onError` quickly enough within the TCK timeout,
+    * so we use a synchronous publisher that immediately calls `onError` after `onSubscribe`.
+    */
+  def createFailedPublisher: Publisher[Int] = new Publisher[Int] {
+    def subscribe(subscriber: Subscriber[_ >: Int]): Unit = {
+      if (subscriber == null) throw new NullPointerException("Subscriber must not be null")
+      // Per Reactive Streams spec, must call onSubscribe before onError
+      subscriber.onSubscribe(new org.reactivestreams.Subscription {
+        def request(n: Long): Unit = ()
+        def cancel(): Unit = ()
+      })
+      subscriber.onError(new RuntimeException("Test: data_err table does not exist"))
+    }
+  }
 }

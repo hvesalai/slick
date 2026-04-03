@@ -70,16 +70,16 @@ def slickScalacOptions = Seq(
       "-Wconf:cat=unused-imports&src=src_managed/.*:silent"
     ) ++ (CrossVersion.partialVersion(scalaVersion.value) match {
       case Some((2, 12)) =>
-        List("-Ywarn-unused:imports", "-language:higherKinds", "-Xsource:3") ++ scala2InlineSettings.value
+        List("-Ywarn-unused:imports", "-language:higherKinds", "-Xsource:3", "-Xfatal-warnings") ++ scala2InlineSettings.value
       case Some((2, 13)) =>
         List(
           "-Xsource:3-cross",
           "-Wunused:imports",
           "-Wconf:cat=unused-imports&origin=scala\\.collection\\.compat\\._:s",
-          "-Wconf:cat=deprecation&origin=scala\\.math\\.Numeric\\.signum:s"
+          "-Xfatal-warnings"
         ) ++ scala2InlineSettings.value
       case Some((3, _)) =>
-        List("-source:3.0-migration")
+        List("-source:3.0-migration", "-Werror")
       case _ =>
         Nil
     })
@@ -227,6 +227,8 @@ lazy val testkit =
       libraryDependencies ++=
         Dependencies.junit ++:
           (Dependencies.reactiveStreamsTCK % Test) +:
+          (Dependencies.fs2ReactiveStreams % Test) +:
+          (Dependencies.munitCatsEffect % Test) +:
           (Dependencies.logback +: Dependencies.testDBs).map(_ % Test) ++:
           (Dependencies.logback +: Dependencies.testDBs).map(_ % TypeProviders.TypeProvidersConfig),
       run / fork := true,
@@ -301,9 +303,26 @@ lazy val hikaricp =
       libraryDependencies += Dependencies.hikariCP.exclude("org.slf4j", "*"),
     )
 
+lazy val `slick-reactive-streams` =
+  project
+    .in(file("slick-reactive-streams"))
+    .dependsOn(slick)
+    .settings(
+      slickGeneralSettings,
+      extTarget("slick-reactive-streams"),
+      name := "Slick-ReactiveStreams",
+      description := "Optional Reactive Streams compatibility adapter for Slick 4",
+      scaladocSourceUrl("slick-reactive-streams"),
+      test := {}, testOnly := {},
+      libraryDependencies ++= Seq(
+        Dependencies.reactiveStreams,
+        Dependencies.fs2ReactiveStreams
+      )
+    )
+
 lazy val `reactive-streams-tests` =
   project
-    .dependsOn(testkit)
+    .dependsOn(testkit, `slick-reactive-streams`)
     .settings(
       slickGeneralSettings,
       name := "Slick-ReactiveStreamsTests",
@@ -380,7 +399,7 @@ lazy val site: Project =
 lazy val root =
   project
     .in(file("."))
-    .aggregate(slick, codegen, hikaricp, testkit, site)
+    .aggregate(slick, codegen, hikaricp, testkit, `slick-reactive-streams`, site)
     .settings(
       name := "slick-root",
       slickGeneralSettings,
