@@ -98,6 +98,9 @@ def slickScalacOptions = Seq(
           "-Ywarn-unused:imports",
           "-language:higherKinds",
           "-Xsource:3",
+          // Scala 2.13 and 3 unify `SlickAction[E, R]` with an `F[_]` out of the box; 2.12 needs this
+          // flag for it, as it does for cats in general.
+          "-Ypartial-unification",
           "-Wconf:cat=unused-imports&src=src_managed/.*:silent",
           "-Wconf:cat=unused-imports&origin=slick\\.compat\\.collection\\..*:s"
         ) ++ scala2InlineSettings.value
