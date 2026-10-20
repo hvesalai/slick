@@ -68,6 +68,9 @@ trait BasicProfile extends BasicActionComponent { self: BasicProfile =>
   /** The compiler used for updates */
   def updateCompiler: QueryCompiler
 
+  /** The compiler used for updates that do not set AutoInc columns */
+  def softUpdateCompiler: QueryCompiler
+
   /** The compiler used for deleting data */
   def deleteCompiler: QueryCompiler
 

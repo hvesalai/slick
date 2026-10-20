@@ -26,6 +26,7 @@ class DistributedProfile(val profiles: RelationalProfile*) extends MemoryQueryin
       QueryCompiler.interpreterPhases +
       new MemoryCodeGen
   override lazy val updateCompiler: Nothing = ??
+  override lazy val softUpdateCompiler: Nothing = ??
   override lazy val deleteCompiler: Nothing = ??
   override lazy val insertCompiler: Nothing = ??
 

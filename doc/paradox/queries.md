@@ -331,6 +331,14 @@ When you want to update multiple columns at once, just map to a tuple first:
 
 @@snip [LiftedEmbedding.scala](../code/LiftedEmbedding.scala) { #update2 }
 
+`update` sets every selected column, including `AutoInc` columns. Many databases do not allow changing an identity
+column (SQL Server, and PostgreSQL for `GENERATED ALWAYS` columns), so updating a whole row of such a table fails.
+`softUpdate` skips `AutoInc` columns, like `+=` does for inserts, however they were selected: whole rows, mapped
+projections and projections that list the `AutoInc` column explicitly. If all selected columns are `AutoInc` columns,
+there is nothing to update, and `softUpdate` and `softUpdateStatement` throw a `SlickException`.
+
+@@snip [LiftedEmbedding.scala](../code/LiftedEmbedding.scala) { #softUpdate }
+
 Upserting
 ---------
 

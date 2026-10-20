@@ -2,7 +2,7 @@ package slick.relational
 
 import slick.ast.*
 import slick.SlickException
-import slick.util.SlickLogger
+import slick.util.{ConstArray, SlickLogger}
 
 import org.slf4j.LoggerFactory
 
@@ -12,11 +12,9 @@ trait ResultConverterCompiler[R, W, U] {
 
   def compile(n: Node): ResultConverter[R, W, U, ?] = n match {
     case InsertColumn(paths, fs, _) =>
-      val pathConvs = paths.map { case Select(_, ElementSymbol(idx)) => createColumnConverter(n, idx, Some(fs)).asInstanceOf[ResultConverter[R, W, U, Any]] }
-      if(pathConvs.length == 1) pathConvs.head else CompoundResultConverter[R, W, U, Any](1, pathConvs.toSeq: _*)
+      compileInsertColumn(n, paths, fs)
     case OptionApply(InsertColumn(paths, fs, _)) =>
-      val pathConvs = paths.map { case Select(_, ElementSymbol(idx)) => createColumnConverter(n, idx, Some(fs)).asInstanceOf[ResultConverter[R, W, U, Any]] }
-      if(pathConvs.length == 1) pathConvs.head else CompoundResultConverter[R, W, U, Any](1, pathConvs.toSeq: _*)
+      compileInsertColumn(n, paths, fs)
     case Select(_, ElementSymbol(idx)) => createColumnConverter(n, idx, None)
     case cast @ Library.SilentCast(sel @ Select(_, ElementSymbol(idx))) =>
       createColumnConverter(sel :@ cast.nodeType, idx, None)
@@ -34,6 +32,16 @@ trait ResultConverterCompiler[R, W, U] {
       createOptionRebuildingConverter(discConv, dataConv)
     case n =>
       throw new SlickException("Unexpected node in ResultSetMapping: "+n)
+  }
+
+  /** An `InsertColumn` writes its value to each of its paths. Its width is the number of paths, so a column that
+    * is not written at all (an AutoInc column in a standard insert or in `softUpdate`) takes up no
+    * parameters. */
+  private def compileInsertColumn(n: Node, paths: ConstArray[Node], fs: FieldSymbol): ResultConverter[R, W, U, ?] = {
+    val pathConvs = paths.map { case Select(_, ElementSymbol(idx)) => createColumnConverter(n, idx, Some(fs)).asInstanceOf[ResultConverter[R, W, U, Any]] }
+
+    if (pathConvs.length == 1) pathConvs.head
+    else CompoundResultConverter[R, W, U, Any](pathConvs.length, pathConvs.toSeq: _*)
   }
 
   def createGetOrElseResultConverter[T](rc: ResultConverter[R, W, U, Option[T]], default: () => T): ResultConverter[R, W, U, T] =

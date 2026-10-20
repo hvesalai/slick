@@ -501,6 +501,19 @@ object LiftedEmbedding {
           //#update2
           println(sql)
         }
+        {
+          //#softUpdate
+          val q = users.filter(_.id === 1)
+          // Updates "first" and "last"; the AutoInc "id" keeps its value:
+          val updateAction = q.softUpdate(User(None, "Homer", "Simpson"))
+
+          val sql = q.softUpdateStatement
+
+          // compiles to SQL:
+          //   update "users" set "first" = ?, "last" = ? where "users"."id" = 1
+          //#softUpdate
+          println(sql)
+        }
 
         db.run(
           usersForInsert ++= Seq(

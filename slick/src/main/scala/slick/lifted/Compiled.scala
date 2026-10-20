@@ -43,6 +43,7 @@ trait CompilersMixin { this: Compiled[?] =>
   def toNode: Node
   lazy val compiledQuery = profile.queryCompiler.run(toNode).tree
   lazy val compiledUpdate = profile.updateCompiler.run(toNode).tree
+  lazy val compiledSoftUpdate = profile.softUpdateCompiler.run(toNode).tree
   lazy val compiledDelete = profile.deleteCompiler.run(toNode).tree
   lazy val compiledInsert = profile.compileInsert(toNode)
 }
@@ -69,6 +70,7 @@ trait RunnableCompiled[R, RU] extends Compiled[R] {
   def param: Any
   def compiledQuery: Node
   def compiledUpdate: Node
+  def compiledSoftUpdate: Node
   def compiledDelete: Node
   def compiledInsert: Any // Actually of the profile's CompiledInsert type
 }
@@ -82,6 +84,7 @@ class AppliedCompiledFunction[PU, R <: Rep[?], RU](val param: PU,
   lazy val extract: R = function.applied(param)
   def compiledQuery = function.compiledQuery
   def compiledUpdate = function.compiledUpdate
+  def compiledSoftUpdate = function.compiledSoftUpdate
   def compiledDelete = function.compiledDelete
   def compiledInsert: Any = function.compiledInsert
 }

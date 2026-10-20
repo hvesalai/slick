@@ -297,18 +297,40 @@ trait JdbcActionComponent extends SqlActionComponent { self: JdbcProfile =>
 
   type UpdateActionExtensionMethods[T] = UpdateActionExtensionMethodsImpl[T]
 
-  def createUpdateActionExtensionMethods[T](tree: Node, param: Any): UpdateActionExtensionMethods[T] =
-    new UpdateActionExtensionMethodsImpl[T](tree, param)
+  /** Create the update extension methods from the trees compiled by `updateCompiler` and
+    * `softUpdateCompiler`. The latter is only compiled when `softUpdate` is used. */
+  def createUpdateActionExtensionMethods[T](tree: Node,
+                                            softTree: => Node,
+                                            param: Any): UpdateActionExtensionMethods[T] =
+    new UpdateActionExtensionMethodsImpl[T](tree, softTree, param)
 
-  class UpdateActionExtensionMethodsImpl[T](tree: Node, param: Any) {
+  class UpdateActionExtensionMethodsImpl[T](tree: Node, softTree: => Node, param: Any) {
     protected[this] val ResultSetMapping(_,
       CompiledStatement(_, sres: SQLBuilder.Result, _),
       CompiledMapping(_converter, _)) = tree
     protected[this] val converter = _converter.asInstanceOf[ResultConverter[ResultSet, PreparedStatement, ResultSet, T]]
 
+    protected[this] lazy val (softSres, softConverter) = {
+      val ResultSetMapping(_, CompiledStatement(_, sres: SQLBuilder.Result, _), CompiledMapping(converter, _)) =
+        softTree: @unchecked
+
+      (sres, converter.asInstanceOf[ResultConverter[ResultSet, PreparedStatement, ResultSet, T]])
+    }
+
     /** An Action that updates the data selected by this query. */
-    def update(value: T): ProfileAction[Int, NoStream, Effect.Write] = {
-      new SimpleJdbcProfileAction[Int]("update", Vector(sres.sql)) {
+    def update(value: T): ProfileAction[Int, NoStream, Effect.Write] = updateAction("update", sres, converter, value)
+
+    /** An Action that updates the data selected by this query, except AutoInc columns, which keep their values.
+      * Like `+=` for inserts, it skips AutoInc columns however they were selected, also when the projection lists
+      * them explicitly. A `SlickException` is thrown if all selected columns are AutoInc columns. */
+    def softUpdate(value: T): ProfileAction[Int, NoStream, Effect.Write] =
+      updateAction("softUpdate", softSres, softConverter, value)
+
+    protected[this] def updateAction(name: String,
+                                     sres: SQLBuilder.Result,
+                                     converter: ResultConverter[ResultSet, PreparedStatement, ResultSet, T],
+                                     value: T): ProfileAction[Int, NoStream, Effect.Write] =
+      new SimpleJdbcProfileAction[Int](name, Vector(sres.sql)) {
         def run(ctx: JdbcBackend#JdbcActionContext, sql: Vector[String]): Int = ctx.session.withPreparedStatement(sql.head) { st =>
           st.clearParameters
           converter.set(value, st, 0)
@@ -316,9 +338,12 @@ trait JdbcActionComponent extends SqlActionComponent { self: JdbcProfile =>
           st.executeUpdate
         }
       }
-    }
+
     /** Get the statement used by `update` */
     def updateStatement: String = sres.sql
+
+    /** Get the statement used by `softUpdate` */
+    def softUpdateStatement: String = softSres.sql
   }
 
   ///////////////////////////////////////////////////////////////////////////////////////////////

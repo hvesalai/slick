@@ -2,10 +2,12 @@ package slick.jdbc
 
 import java.sql.{PreparedStatement, ResultSet}
 
+import slick.SlickException
 import slick.ast.*
-import slick.compiler.{CodeGen, CompilerState}
+import slick.ast.Util.*
+import slick.compiler.{CodeGen, CompilerState, InsertCompiler}
 import slick.relational.*
-import slick.util.SQLBuilder
+import slick.util.{ConstArray, SQLBuilder}
 
 /** JDBC profile component which contains the mapping compiler and insert compiler */
 trait JdbcMappingCompilerComponent { self: JdbcProfile =>
@@ -65,6 +67,65 @@ trait JdbcMappingCompilerComponent { self: JdbcProfile =>
       val (tree, tpe) = treeAndType(serverSide)
       val sbr = f(self.createQueryBuilder(tree, state))
       (CompiledStatement(sbr.sql, sbr, tpe).infer(), mapping.map(mappingCompiler.compileMapping))
+    }
+  }
+
+  /** Code generator phase for updates on JdbcProfile that only set the selected columns which the `mode` includes,
+    * e.g. `InsertCompiler.NonAutoInc` for `softUpdate`. The other columns are left out of the `SET` clause,
+    * and the mapping writes no parameters for them, like the `InsertColumn`s of a standard insert. */
+  class JdbcUpdateCodeGen(mode: InsertCompiler.Mode) extends JdbcCodeGen(_.buildUpdate()) {
+    override def compileServerSideAndMapping(serverSide: Node,
+                                             mapping: Option[Node],
+                                             state: CompilerState): (CompiledStatement, Option[CompiledMapping]) = {
+      val (tree, tpe) = treeAndType(serverSide)
+
+      tree match {
+        case c @ Comprehension(sym, _: TableNode, Pure(ProductNode(columns), ts), _, _, _, _, _, _, _, _) =>
+          // The 1-based positions of the selected columns that are not set; `buildUpdate` rejects other selections
+          val excluded = columns.iterator.zipWithIndex.collect {
+            case (Select(Ref(s), fs: FieldSymbol), idx) if s == sym && !mode(fs) => (idx + 1, fs)
+          }.toMap
+          val nothingToSet = excluded.size == columns.length
+
+          if (excluded.isEmpty) super.compileServerSideAndMapping(serverSide, mapping, state)
+          else if (nothingToSet) throw noColumnsToSet
+          else {
+            val kept =
+              ProductNode(ConstArray.from(columns.toSeq.zipWithIndex.collect {
+                case (n, idx) if !excluded.contains(idx + 1) => n
+              })).infer()
+            val tree2 = c.copy(select = Pure(kept, ts).infer()).infer()
+            val sbr = self.createQueryBuilder(tree2, state).buildUpdate()
+
+            (CompiledStatement(sbr.sql, sbr, tpe).infer(),
+              mapping.map(m => mappingCompiler.compileMapping(skipColumns(m, columns.length, excluded))))
+          }
+        case Comprehension(sym, _: TableNode, Pure(Select(Ref(s), fs: FieldSymbol), _), _, _, _, _, _, _, _, _)
+          if s == sym && !mode(fs) =>
+          throw noColumnsToSet
+        case _ =>
+          super.compileServerSideAndMapping(serverSide, mapping, state)
+      }
+    }
+
+    private def noColumnsToSet =
+      new SlickException("All columns selected for this update are AutoInc columns, which are not set, so there are " +
+        "no columns to update -- use update to set them")
+
+    /** Replace the excluded columns in a mapping by `InsertColumn`s without paths, which write nothing, and renumber
+      * the remaining columns to match the shortened `SET` clause. */
+    private def skipColumns(mapping: Node, width: Int, excluded: Map[Int, FieldSymbol]): Node = {
+      val newIndex = (1 to width).filterNot(excluded.contains).zipWithIndex.map { case (idx, i) => (idx, i + 1) }.toMap
+
+      mapping.replace({
+        case cast @ Library.SilentCast(Select(_, ElementSymbol(idx))) if excluded.contains(idx) =>
+          InsertColumn(ConstArray.empty, excluded(idx), cast.nodeType)
+        case sel @ Select(ref, ElementSymbol(idx)) =>
+          excluded.get(idx) match {
+            case Some(fs) => InsertColumn(ConstArray.empty, fs, sel.nodeType)
+            case None     => Select(ref, ElementSymbol(newIndex(idx))) :@ sel.nodeType
+          }
+      }, keepType = true)
     }
   }
 

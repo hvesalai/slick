@@ -25,6 +25,7 @@ trait MemoryProfile extends RelationalProfile with MemoryQueryingProfile { self:
 
   lazy val queryCompiler = compiler + new MemoryCodeGen
   lazy val updateCompiler = compiler
+  lazy val softUpdateCompiler = compiler
   lazy val deleteCompiler = compiler
   lazy val insertCompiler =
     QueryCompiler(

@@ -31,6 +31,7 @@ trait JdbcProfile extends SqlProfile with JdbcActionComponent
 
   lazy val queryCompiler = compiler + new JdbcCodeGen(_.buildSelect())
   lazy val updateCompiler = compiler + new JdbcCodeGen(_.buildUpdate())
+  lazy val softUpdateCompiler = compiler + new JdbcUpdateCodeGen(InsertCompiler.NonAutoInc)
   lazy val deleteCompiler = compiler + new JdbcCodeGen(_.buildDelete())
   lazy val insertCompiler =
     QueryCompiler(
@@ -75,7 +76,7 @@ trait JdbcProfile extends SqlProfile with JdbcActionComponent
 
   trait JdbcLowPriorityAPI {
     implicit def queryUpdateActionExtensionMethods[U, C[_]](q: Query[?, U, C]): UpdateActionExtensionMethodsImpl[U] =
-      createUpdateActionExtensionMethods(updateCompiler.run(q.toNode).tree, ())
+      createUpdateActionExtensionMethods(updateCompiler.run(q.toNode).tree, softUpdateCompiler.run(q.toNode).tree, ())
   }
 
   trait JdbcAPI extends JdbcLowPriorityAPI with RelationalAPI with JdbcImplicitColumnTypes {
@@ -91,7 +92,7 @@ trait JdbcProfile extends SqlProfile with JdbcActionComponent
 
     implicit def runnableCompiledUpdateActionExtensionMethods[RU, C[_]](c: RunnableCompiled[? <: Query[?, ?, C], C[RU]]
                                                                        ): UpdateActionExtensionMethods[RU] =
-      createUpdateActionExtensionMethods(c.compiledUpdate, c.param)
+      createUpdateActionExtensionMethods(c.compiledUpdate, c.compiledSoftUpdate, c.param)
 
     implicit def jdbcActionExtensionMethods[E <: Effect, R, S <: NoStream](a: DBIOAction[R, S, E]
                                                                           ): JdbcActionExtensionMethods[E, R, S] =
