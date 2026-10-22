@@ -1,7 +1,7 @@
 package slick.jdbc
 
-import java.sql.{PreparedStatement, ResultSet}
-import java.time.{Instant, LocalDateTime}
+import java.sql.{PreparedStatement, ResultSet, Timestamp}
+import java.time.{Instant, LocalDateTime, OffsetDateTime, ZoneOffset, ZonedDateTime}
 
 import slick.SlickException
 import slick.ast.*
@@ -64,8 +64,8 @@ import com.typesafe.config.Config
   * MySQL keeps their fractional seconds (down to microseconds). The precision can be changed for all such
   * columns with <code>slick.jdbc.MySQLProfile.defaultFractionalSecondsPrecision</code> in application.conf
   * (0 to 6; 0 creates plain "TIMESTAMP" and "TIME" columns, which store whole seconds). `O.SqlType` overrides
-  * the type of a single column. This covers the `java.sql` types only; the `java.time` types have their own
-  * mappings.
+  * the type of a single column. The same precision is used for the TIME, DATETIME and TIMESTAMP columns of the
+  * `java.time` types (see "Date and Time types" in the manual).
   *
   * Note: Slick 3.2 also checks the old config path "slick.driver.MySQL" that was used
   * by Slick 3.0 and 3.1, and logs a warning if anything is found there. Values from the
@@ -232,13 +232,13 @@ trait MySQLProfile extends JdbcProfile with JdbcActionComponent.MultipleRowsPerS
 
   protected lazy val defaultStringType = profileConfig.getStringOpt("defaultStringType")
 
-  /** The number of fractional-second digits (0 to 6) of the TIMESTAMP and TIME columns that Slick creates.
-    * MySQL rounds a value to the precision of its column, and a column without a precision stores whole
+  /** The number of fractional-second digits (0 to 6) of the TIME, DATETIME and TIMESTAMP columns that Slick
+    * creates. MySQL rounds a value to the precision of its column, and a column without a precision stores whole
     * seconds. */
   protected lazy val defaultFractionalSecondsPrecision: Int =
     profileConfig.getIntOpt("defaultFractionalSecondsPrecision").getOrElse(6)
 
-  /** Appends [[defaultFractionalSecondsPrecision]] to a TIMESTAMP or TIME type name, unless it is 0. */
+  /** Appends [[defaultFractionalSecondsPrecision]] to a TIME, DATETIME or TIMESTAMP type name, unless it is 0. */
   private def withFractionalSeconds(typeName: String): String =
     if (defaultFractionalSecondsPrecision == 0) typeName
     else s"$typeName($defaultFractionalSecondsPrecision)"
@@ -476,7 +476,66 @@ trait MySQLProfile extends JdbcProfile with JdbcActionComponent.MultipleRowsPerS
         "x'"+value.toString.replace("-", "")+"'"
     }
 
-    override val instantType : InstantJdbcType = new InstantJdbcType {
+    override val localDateTimeType: LocalDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyMySQLLocalDateTimeJdbcType else new MySQLLocalDateTimeJdbcType
+    override val instantType: InstantJdbcType =
+      if (useTextJavaTimeStorage) new LegacyMySQLInstantJdbcType else new MySQLInstantJdbcType
+    override val offsetTimeType: OffsetTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyOffsetTimeJdbcType else new TextOffsetTimeJdbcType
+    override val offsetDateTimeType: OffsetDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyOffsetDateTimeJdbcType else new MySQLOffsetDateTimeJdbcType
+    override val zonedDateType: ZonedDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyZonedDateTimeJdbcType else new MySQLZonedDateTimeJdbcType
+
+    /* LocalDate, LocalTime and LocalDateTime are stored in DATE, TIME(6) and DATETIME(6), which keep the
+     * wall-clock value they are given, independent of any time zone (the precision is
+     * defaultFractionalSecondsPrecision). */
+    class MySQLLocalDateTimeJdbcType extends LocalDateTimeJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = withFractionalSeconds("DATETIME")
+    }
+
+    /* Instant, OffsetDateTime and ZonedDateTime are stored in TIMESTAMP(6), which keeps the instant (in the range
+     * 1970 to 2038) but not the offset or zone; they are read back in UTC. MySQL converts a TIMESTAMP between UTC and
+     * the wall-clock time in the session time zone, and the driver between that wall-clock time and the instant in
+     * connectionTimeZone, so this is only correct when the two zones are the same, e.g. with
+     * connectionTimeZone=+00:00&forceConnectionTimeZoneToSession=true. The values are bound as a
+     * java.sql.Timestamp, which is an instant: the driver's setObject for OffsetDateTime and Instant goes through
+     * the JVM time zone and moves an instant in its DST overlap by an hour. Literals carry an explicit offset,
+     * which MySQL converts itself. */
+    private[this] def setInstant(v: Instant, p: PreparedStatement, idx: Int): Unit = p.setTimestamp(idx, Timestamp.from(v))
+    private[this] def updateInstant(v: Instant, r: ResultSet, idx: Int): Unit = r.updateTimestamp(idx, Timestamp.from(v))
+    private[this] def instantLiteral(v: OffsetDateTime): String = s"'${JavaTimeFormats.offsetDateTime.format(v)}'"
+
+    class MySQLInstantJdbcType extends InstantJdbcType {
+      override def sqlType: Int = java.sql.Types.TIMESTAMP
+      override def setValue(v: Instant, p: PreparedStatement, idx: Int): Unit = setInstant(v, p, idx)
+      override def updateValue(v: Instant, r: ResultSet, idx: Int): Unit = updateInstant(v, r, idx)
+      override def valueToSQLLiteral(value: Instant) = instantLiteral(value.atOffset(ZoneOffset.UTC))
+    }
+    class MySQLOffsetDateTimeJdbcType extends OffsetDateTimeJdbcType {
+      override def sqlType: Int = java.sql.Types.TIMESTAMP
+      override def setValue(v: OffsetDateTime, p: PreparedStatement, idx: Int): Unit = setInstant(v.toInstant, p, idx)
+      override def getValue(r: ResultSet, idx: Int): OffsetDateTime = super.getValue(r, idx) match {
+        case null  => null
+        case value => value.withOffsetSameInstant(ZoneOffset.UTC)
+      }
+      override def updateValue(v: OffsetDateTime, r: ResultSet, idx: Int): Unit = updateInstant(v.toInstant, r, idx)
+      override def valueToSQLLiteral(value: OffsetDateTime) = instantLiteral(value)
+    }
+    class MySQLZonedDateTimeJdbcType extends ZonedDateTimeJdbcType {
+      override def sqlType: Int = java.sql.Types.TIMESTAMP
+      override def setValue(v: ZonedDateTime, p: PreparedStatement, idx: Int): Unit = setInstant(v.toInstant, p, idx)
+      override def getValue(r: ResultSet, idx: Int): ZonedDateTime = super.getValue(r, idx) match {
+        case null  => null
+        case value => value.withZoneSameInstant(ZoneOffset.UTC)
+      }
+      override def updateValue(v: ZonedDateTime, r: ResultSet, idx: Int): Unit = updateInstant(v.toInstant, r, idx)
+      override def valueToSQLLiteral(value: ZonedDateTime) = instantLiteral(value.toOffsetDateTime)
+    }
+
+    /* The mappings of Slick 3 (useTextJavaTimeStorage) */
+
+    class LegacyMySQLInstantJdbcType extends LegacyInstantJdbcType {
       override def sqlType : Int = {
         /**
          * [[Instant]] will be persisted as a [[java.sql.Types.VARCHAR]] in order to
@@ -502,7 +561,7 @@ trait MySQLProfile extends JdbcProfile with JdbcActionComponent.MultipleRowsPerS
       }
     }
 
-    override val localDateTimeType : LocalDateTimeJdbcType = new LocalDateTimeJdbcType {
+    class LegacyMySQLLocalDateTimeJdbcType extends LegacyLocalDateTimeJdbcType {
       override def sqlType : Int = {
         /**
          * [[LocalDateTime]] will be persisted as a [[java.sql.Types.VARCHAR]] in order to

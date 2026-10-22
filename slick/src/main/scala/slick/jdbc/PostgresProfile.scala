@@ -315,11 +315,18 @@ trait PostgresProfile extends JdbcProfile with JdbcActionComponent.MultipleRowsP
     override val byteArrayJdbcType: PostgresByteArrayJdbcType = new PostgresByteArrayJdbcType
     override val uuidJdbcType: PostgresUUIDJdbcType = new PostgresUUIDJdbcType
     override val localDateType: PostgresLocalDateJdbcType = new PostgresLocalDateJdbcType
-    override val localTimeType: PostgresLocalTimeJdbcType = new PostgresLocalTimeJdbcType
-    override val offsetTimeType: PostgresOffsetTimeJdbcType = new PostgresOffsetTimeJdbcType
-    //OffsetDateTime and ZonedDateTime not currently supportable natively by the backend
-    override val instantType: PostgresInstantJdbcType = new PostgresInstantJdbcType
-    override val localDateTimeType: PostgresLocalDateTimeJdbcType = new PostgresLocalDateTimeJdbcType
+    override val localTimeType: PostgresLocalTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyPostgresLocalTimeJdbcType else new PostgresLocalTimeJdbcType
+    override val offsetTimeType: PostgresOffsetTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyPostgresOffsetTimeJdbcType else new PostgresOffsetTimeJdbcType
+    override val instantType: InstantJdbcType =
+      if (useTextJavaTimeStorage) new LegacyPostgresInstantJdbcType else new PostgresInstantJdbcType
+    override val localDateTimeType: PostgresLocalDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyPostgresLocalDateTimeJdbcType else new PostgresLocalDateTimeJdbcType
+    override val offsetDateTimeType: OffsetDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyOffsetDateTimeJdbcType else new PostgresOffsetDateTimeJdbcType
+    override val zonedDateType: ZonedDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyZonedDateTimeJdbcType else new PostgresZonedDateTimeJdbcType
 
     protected val nullCharReplacement: String = ""
 
@@ -419,24 +426,26 @@ trait PostgresProfile extends JdbcProfile with JdbcActionComponent.MultipleRowsP
       }
 
       override val sqlType = java.sql.Types.OTHER
-      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIME"
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIME(6)"
       override def setValue(v: LocalTime, p: PreparedStatement, idx: Int) = {
         p.setObject(idx, serializeTime(v), sqlType)
       }
       override def updateValue(v: LocalTime, r: ResultSet, idx: Int) = {
-        r.updateObject(idx, createPGObject(serializeTime(v), sqlTypeName(None)))
+        r.updateObject(idx, createPGObject(serializeTime(v), "TIME"))
       }
       override def getValue(r: ResultSet, idx: Int): LocalTime = parseTime(r.getString(idx))
       override val hasLiteralForm : Boolean = false
     }
 
-    class PostgresOffsetTimeJdbcType extends OffsetTimeJdbcType with PostgresTimeJdbcType[OffsetTime] {
+    /** @param fractionDigits The fractional digits that are sent; PostgreSQL rounds any beyond 6 */
+    class PostgresOffsetTimeJdbcType(fractionDigits: Int = 9) extends OffsetTimeJdbcType
+      with PostgresTimeJdbcType[OffsetTime] {
 
       private[this] val formatter : DateTimeFormatter = {
         new DateTimeFormatterBuilder()
           .append(DateTimeFormatter.ofPattern("HH:mm:ss"))
           .optionalStart()
-          .appendFraction(ChronoField.NANO_OF_SECOND, 0, 6, true)
+          .appendFraction(ChronoField.NANO_OF_SECOND, 0, fractionDigits, true)
           .optionalEnd()
           .appendOffset("+HH:mm", "+00")
           .toFormatter()
@@ -475,7 +484,104 @@ trait PostgresProfile extends JdbcProfile with JdbcActionComponent.MultipleRowsP
       override val hasLiteralForm : Boolean = false
     }
 
+    /** Reads the text of a `timestamptz` (or `timestamp`) value: a date and time with up to 6 fractional
+      * digits, followed by the offset of the session time zone, e.g. `+03`, `+05:30` or `+01:39:49`. A value
+      * without an offset is read as UTC. */
+    private[this] val timestamptzParser: DateTimeFormatter =
+      new DateTimeFormatterBuilder()
+        .append(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+        .optionalStart()
+        .appendFraction(ChronoField.NANO_OF_SECOND, 0, 6, true)
+        .optionalEnd()
+        .optionalStart()
+        .appendOffset("+HH:mm:ss", "+00")
+        .optionalEnd()
+        .toFormatter()
+
+    /** Parses a timestamptz value as an OffsetDateTime in UTC. Values that a select list returns as text
+      * (an untyped parameter) are in the ISO format they were bound in. */
+    protected def parseTimestamptz(text: String): OffsetDateTime = {
+      val parsed = try timestamptzParser.parse(text) catch {
+        case _: java.time.format.DateTimeParseException => DateTimeFormatter.ISO_DATE_TIME.parse(text)
+      }
+
+      if (parsed.isSupported(ChronoField.OFFSET_SECONDS)) OffsetDateTime.from(parsed).withOffsetSameInstant(ZoneOffset.UTC)
+      else LocalDateTime.from(parsed).atOffset(ZoneOffset.UTC)
+    }
+
+    /* Instant, OffsetDateTime and ZonedDateTime are stored as timestamptz, which keeps the instant in UTC but
+     * not the offset or zone. They are bound as ISO text with their offset (PostgreSQL converts it to UTC) and
+     * read back in UTC. -infinity and infinity map to the MIN and MAX values. */
+
     class PostgresInstantJdbcType extends InstantJdbcType with PostgresInfinityTimeJdbcType[Instant] {
+      val min : Instant = Instant.MIN
+      val max : Instant = Instant.MAX
+      val serializeFiniteTime : Instant => String = _.toString
+      val parseFiniteTime : String => Instant = parseTimestamptz(_).toInstant
+
+      override val sqlType = java.sql.Types.OTHER
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMPTZ"
+      override def getValue(r: ResultSet, idx: Int): Instant = parseTime(r.getString(idx))
+      override def setValue(v: Instant, p: PreparedStatement, idx: Int) = {
+        p.setObject(idx, serializeTime(v), sqlType)
+      }
+      override def updateValue(v: Instant, r: ResultSet, idx: Int) = {
+        r.updateObject(idx, createPGObject(serializeTime(v), "TIMESTAMPTZ"))
+      }
+      override val hasLiteralForm : Boolean = false
+    }
+
+    class PostgresOffsetDateTimeJdbcType extends OffsetDateTimeJdbcType
+      with PostgresInfinityTimeJdbcType[OffsetDateTime] {
+      val min : OffsetDateTime = OffsetDateTime.MIN
+      val max : OffsetDateTime = OffsetDateTime.MAX
+      val serializeFiniteTime : OffsetDateTime => String = _.format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+      val parseFiniteTime : String => OffsetDateTime = parseTimestamptz
+
+      override val sqlType = java.sql.Types.OTHER
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMPTZ"
+      override def getValue(r: ResultSet, idx: Int): OffsetDateTime = parseTime(r.getString(idx))
+      override def setValue(v: OffsetDateTime, p: PreparedStatement, idx: Int) = {
+        p.setObject(idx, serializeTime(v), sqlType)
+      }
+      override def updateValue(v: OffsetDateTime, r: ResultSet, idx: Int) = {
+        r.updateObject(idx, createPGObject(serializeTime(v), "TIMESTAMPTZ"))
+      }
+      override val hasLiteralForm : Boolean = false
+    }
+
+    class PostgresZonedDateTimeJdbcType extends ZonedDateTimeJdbcType
+      with PostgresTimeJdbcType[ZonedDateTime] {
+      val min : ZonedDateTime = null
+      val max : ZonedDateTime = null
+      val serializeFiniteTime : ZonedDateTime => String = _.toOffsetDateTime.format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+      val parseFiniteTime : String => ZonedDateTime = parseTimestamptz(_).toZonedDateTime
+
+      override val sqlType = java.sql.Types.OTHER
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMPTZ"
+      override def getValue(r: ResultSet, idx: Int): ZonedDateTime = parseTime(r.getString(idx))
+      override def setValue(v: ZonedDateTime, p: PreparedStatement, idx: Int) = {
+        p.setObject(idx, serializeTime(v), sqlType)
+      }
+      override def updateValue(v: ZonedDateTime, r: ResultSet, idx: Int) = {
+        r.updateObject(idx, createPGObject(serializeTime(v), "TIMESTAMPTZ"))
+      }
+      override val hasLiteralForm : Boolean = false
+    }
+
+    /* The mappings of Slick 3 (useTextJavaTimeStorage) */
+
+    class LegacyPostgresLocalTimeJdbcType extends PostgresLocalTimeJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIME"
+    }
+
+    class LegacyPostgresOffsetTimeJdbcType extends PostgresOffsetTimeJdbcType(6)
+
+    class LegacyPostgresLocalDateTimeJdbcType extends PostgresLocalDateTimeJdbcType(6) {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP"
+    }
+
+    class LegacyPostgresInstantJdbcType extends LegacyInstantJdbcType with PostgresInfinityTimeJdbcType[Instant] {
       private[this] val formatter = {
         new DateTimeFormatterBuilder()
           .append(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
@@ -522,12 +628,14 @@ trait PostgresProfile extends JdbcProfile with JdbcActionComponent.MultipleRowsP
       override val hasLiteralForm : Boolean = false
     }
 
-    class PostgresLocalDateTimeJdbcType extends LocalDateTimeJdbcType with PostgresInfinityTimeJdbcType[LocalDateTime] {
+    /** @param fractionDigits The fractional digits that are sent; PostgreSQL rounds any beyond 6 */
+    class PostgresLocalDateTimeJdbcType(fractionDigits: Int = 9) extends LocalDateTimeJdbcType
+      with PostgresInfinityTimeJdbcType[LocalDateTime] {
       private[this] val formatter = {
         new DateTimeFormatterBuilder()
           .append(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
           .optionalStart()
-          .appendFraction(ChronoField.NANO_OF_SECOND,0,6,true)
+          .appendFraction(ChronoField.NANO_OF_SECOND,0,fractionDigits,true)
           .optionalEnd()
           .toFormatter()
       }
@@ -538,13 +646,13 @@ trait PostgresProfile extends JdbcProfile with JdbcActionComponent.MultipleRowsP
       val parseFiniteTime : String => LocalDateTime = LocalDateTime.parse(_, formatter)
 
       override val sqlType = java.sql.Types.OTHER
-      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP"
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP(6)"
       override def getValue(r: ResultSet, idx: Int): LocalDateTime = parseTime(r.getString(idx))
       override def setValue(v: LocalDateTime, p: PreparedStatement, idx: Int) = {
         p.setObject(idx, serializeTime(v), sqlType)
       }
       override def updateValue(v: LocalDateTime, r: ResultSet, idx: Int) = {
-        r.updateObject(idx, createPGObject(serializeTime(v), sqlTypeName(None)))
+        r.updateObject(idx, createPGObject(serializeTime(v), "TIMESTAMP"))
       }
       override val hasLiteralForm : Boolean = false
     }

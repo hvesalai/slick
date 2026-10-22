@@ -2,8 +2,8 @@ package slick.jdbc
 
 import java.sql.{Array as _, *}
 import java.time.*
-import java.time.format.DateTimeFormatter
-import java.util.UUID
+import java.time.format.{DateTimeFormatter, DateTimeFormatterBuilder}
+import java.util.{Calendar, TimeZone, UUID}
 
 import slick.SlickException
 import slick.ast.*
@@ -474,10 +474,18 @@ END;
     override val stringJdbcType: OracleStringJdbcType = new OracleStringJdbcType
     override val timeJdbcType: OracleTimeJdbcType = new OracleTimeJdbcType
     override val uuidJdbcType: OracleUUIDJdbcType = new OracleUUIDJdbcType
-    override val localDateType: OracleLocalDateJdbcType = new OracleLocalDateJdbcType
-    override val localDateTimeType: OracleLocalDateTimeJdbcType = new OracleLocalDateTimeJdbcType
-    override val instantType: OracleInstantJdbcType = new OracleInstantJdbcType
+    override val localDateType: LocalDateJdbcType =
+      if (useTextJavaTimeStorage) new LegacyOracleLocalDateJdbcType else new OracleLocalDateJdbcType
+    override val localTimeType: LocalTimeJdbcType = new TextLocalTimeJdbcType
+    override val localDateTimeType: LocalDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyOracleLocalDateTimeJdbcType else new OracleLocalDateTimeJdbcType
+    override val instantType: InstantJdbcType =
+      if (useTextJavaTimeStorage) new LegacyOracleInstantJdbcType else new OracleInstantJdbcType
     override val offsetTimeType: OracleOffsetTimeJdbcType = new OracleOffsetTimeJdbcType
+    override val offsetDateTimeType: OffsetDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyOffsetDateTimeJdbcType else new OracleOffsetDateTimeJdbcType
+    override val zonedDateType: ZonedDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyZonedDateTimeJdbcType else new OracleZonedDateTimeJdbcType
 
     /* Oracle does not have a proper BOOLEAN type. The suggested workaround is
      * a constrained CHAR with constants 1 and 0 for TRUE and FALSE. */
@@ -552,7 +560,60 @@ END;
       override def hasLiteralForm = true
     }
 
+    /* Oracle has no TIME type, so a LocalTime is stored as text. LocalDateTime is stored in TIMESTAMP(9), and
+     * Instant, OffsetDateTime and ZonedDateTime in TIMESTAMP(9) WITH TIME ZONE, which keeps the offset, or the
+     * zone region of a ZonedDateTime. Such a column cannot be a primary key, and an index on it is
+     * function-based. The driver binds and reads all of them with setObject and getObject, except Instant,
+     * which it does not support: it is bound as an OffsetDateTime in UTC. */
+
+    private[this] val timestamp9Format = "'YYYY-MM-DD HH24:MI:SS.FF9'"
+    private[this] val timestampTz9Format = "'YYYY-MM-DD HH24:MI:SS.FF9 TZH:TZM'"
+    private[this] val timestampTz9 =
+      new DateTimeFormatterBuilder().append(JavaTimeFormats.localDateTime).appendLiteral(' ')
+        .appendOffset("+HH:MM", "+00:00").toFormatter()
+    private[this] def timestampTzLiteral(value: OffsetDateTime): String =
+      s"TO_TIMESTAMP_TZ('${timestampTz9.format(value)}', $timestampTz9Format)"
+
     class OracleLocalDateJdbcType extends LocalDateJdbcType {
+      override def valueToSQLLiteral(value: LocalDate) : String = {
+        s"TO_DATE('${value.toString}', 'SYYYY-MM-DD')"
+      }
+    }
+    /* The driver's setObject converts a LocalDateTime through the JVM time zone, which moves a time in its DST gap
+     * by an hour, so it is bound as a java.sql.Timestamp of the same date and time in UTC, with a UTC Calendar.
+     * (ResultSet.updateTimestamp takes no Calendar, so updates of a mutable result set keep using updateObject.) */
+    class OracleLocalDateTimeJdbcType extends LocalDateTimeJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP(9)"
+      override def setValue(v: LocalDateTime, p: PreparedStatement, idx: Int): Unit =
+        p.setTimestamp(idx, Timestamp.from(v.toInstant(ZoneOffset.UTC)), Calendar.getInstance(TimeZone.getTimeZone(ZoneOffset.UTC)))
+      override def valueToSQLLiteral(value: LocalDateTime) =
+        s"TO_TIMESTAMP('${JavaTimeFormats.localDateTime.format(value)}', $timestamp9Format)"
+    }
+    class OracleInstantJdbcType extends InstantJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP(9) WITH TIME ZONE"
+      override def valueToSQLLiteral(value: Instant) = timestampTzLiteral(value.atOffset(ZoneOffset.UTC))
+    }
+    class OracleOffsetDateTimeJdbcType extends OffsetDateTimeJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP(9) WITH TIME ZONE"
+      override def valueToSQLLiteral(value: OffsetDateTime) = timestampTzLiteral(value)
+    }
+    /* The driver keeps the zone region. The literal is the instant in UTC converted to the region, because a
+     * local date and time in a region is ambiguous in the hour that the clocks are turned back. */
+    class OracleZonedDateTimeJdbcType extends ZonedDateTimeJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP(9) WITH TIME ZONE"
+      override def setValue(v: ZonedDateTime, p: PreparedStatement, idx: Int): Unit = p.setObject(idx, v)
+      override def getValue(r: ResultSet, idx: Int): ZonedDateTime = r.getObject(idx, classOf[ZonedDateTime])
+      override def updateValue(v: ZonedDateTime, r: ResultSet, idx: Int): Unit = r.updateObject(idx, v)
+      override def valueToSQLLiteral(value: ZonedDateTime) = value.getZone match {
+        case _: ZoneOffset => timestampTzLiteral(value.toOffsetDateTime)
+        case region        =>
+          s"(${timestampTzLiteral(value.toOffsetDateTime.withOffsetSameInstant(ZoneOffset.UTC))} AT TIME ZONE '${region.getId}')"
+      }
+    }
+
+    /* The mappings of Slick 3 (useTextJavaTimeStorage) */
+
+    class LegacyOracleLocalDateJdbcType extends LegacyLocalDateJdbcType {
       override def hasLiteralForm: Boolean = true
       override def valueToSQLLiteral(value: LocalDate) : String = {
         s"TO_DATE('${value.toString}', 'SYYYY-MM-DD')"
@@ -568,13 +629,13 @@ END;
     // LocalDateTime and Instant are the 2 types which have no TZ component
     // So, store them at UTC timestamps, otherwise the JDBC layer might attempt to map them
     // and with DST changes, there are some times which will be unrepresentable during the switchover
-    class OracleLocalDateTimeJdbcType extends LocalDateTimeJdbcType {
+    class LegacyOracleLocalDateTimeJdbcType extends LegacyLocalDateTimeJdbcType {
       override def valueToSQLLiteral(value: LocalDateTime) = {
         s"TO_TIMESTAMP(${super.valueToSQLLiteral(value)}, 'YYYY-MM-DD HH24:MI:SS.FF9')"
       }
     }
 
-    class OracleInstantJdbcType extends InstantJdbcType {
+    class LegacyOracleInstantJdbcType extends LegacyInstantJdbcType {
       private[this] val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSSSSS x")
       private[this] def serializeTime(v: Instant) : String = formatter.format(instantToUTC(v))
       private[this] def instantToUTC(v: Instant): OffsetDateTime = v.atOffset(ZoneOffset.UTC)
@@ -594,7 +655,7 @@ END;
     }
 
     // No Oracle time type without date component. Add LocalDate.ofEpochDay(0), but ignore it.
-    class OracleOffsetTimeJdbcType extends OffsetTimeJdbcType {
+    class OracleOffsetTimeJdbcType extends LegacyOffsetTimeJdbcType {
       private[this] val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSSSSS Z")
       private[this] def serializeTime(v : OffsetTime) : String = formatter.format(v.atDate(LocalDate.ofEpochDay(0)))
       override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP(6) WITH TIME ZONE"

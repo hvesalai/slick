@@ -4,7 +4,7 @@ import java.nio.charset.StandardCharsets
 import java.sql.{Array as _, Ref as _, *}
 import java.time.*
 import java.time.format.{DateTimeFormatter, DateTimeFormatterBuilder}
-import java.time.temporal.ChronoField
+import java.time.temporal.{ChronoField, ChronoUnit, Temporal}
 import java.util.UUID
 
 import scala.reflect.{classTag, ClassTag}
@@ -318,11 +318,21 @@ trait SQLServerProfile extends JdbcProfile with JdbcActionComponent.MultipleRows
     override val byteArrayJdbcType: SQLServerByteArrayJdbcType = new SQLServerByteArrayJdbcType
     override val dateJdbcType: SQLServerDateJdbcType = new SQLServerDateJdbcType
     override val timeJdbcType: SQLServerTimeJdbcType = new SQLServerTimeJdbcType
-    override val localTimeType: SQLServerLocalTimeJdbcType = new SQLServerLocalTimeJdbcType
     override val timestampJdbcType: SQLServerTimestampJdbcType = new SQLServerTimestampJdbcType
-    override val localDateTimeType: SQLServerLocalDateTimeJdbcType = new SQLServerLocalDateTimeJdbcType
-    override val instantType: SQLServerInstantJdbcType = new SQLServerInstantJdbcType
-    override val offsetDateTimeType: SQLServerOffsetDateTimeJdbcType = new SQLServerOffsetDateTimeJdbcType
+    override val localDateType: LocalDateJdbcType =
+      if (useTextJavaTimeStorage) new LegacyLocalDateJdbcType else new SQLServerLocalDateJdbcType
+    override val localTimeType: LocalTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacySQLServerLocalTimeJdbcType else new SQLServerLocalTimeJdbcType
+    override val localDateTimeType: LocalDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacySQLServerLocalDateTimeJdbcType else new SQLServerLocalDateTimeJdbcType
+    override val instantType: InstantJdbcType =
+      if (useTextJavaTimeStorage) new LegacySQLServerInstantJdbcType else new SQLServerInstantJdbcType
+    override val offsetTimeType: OffsetTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyOffsetTimeJdbcType else new TextOffsetTimeJdbcType
+    override val offsetDateTimeType: OffsetDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacySQLServerOffsetDateTimeJdbcType else new SQLServerOffsetDateTimeJdbcType
+    override val zonedDateType: ZonedDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyZonedDateTimeJdbcType else new SQLServerZonedDateTimeJdbcType
     override val uuidJdbcType: SQLServerUUIDJdbcType = new SQLServerUUIDJdbcType
     override val stringJdbcType: SQLServerStringJdbcType = new SQLServerStringJdbcType
 
@@ -382,7 +392,73 @@ trait SQLServerProfile extends JdbcProfile with JdbcActionComponent.MultipleRows
       }
     }
 
+    class SQLServerTimestampJdbcType extends TimestampJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "DATETIME2(6)"
+      override def valueToSQLLiteral(value: Timestamp) = s"'$value'"
+    }
+    /* time(7), datetime2(7) and datetimeoffset(7) keep 100 ns. Literals are rounded to that precision like
+     * bound values, and cast to their type, because a plain string literal in a select list is read back as a
+     * string. LocalDate, LocalDateTime, Instant, OffsetDateTime and ZonedDateTime are bound with setObject:
+     * the driver binds them as date, datetime2(7) and datetimeoffset(7). datetimeoffset keeps the offset but
+     * not the zone region of a ZonedDateTime. */
+
+    /** Rounds to 100 ns, the precision of SQL Server's time(7), datetime2(7) and datetimeoffset(7) */
+    private[this] def roundedTo100Nanos[T <: Temporal](value: T): T = {
+      val shifted = value.plus(50, ChronoUnit.NANOS)
+
+      shifted.`with`(ChronoField.NANO_OF_SECOND, shifted.get(ChronoField.NANO_OF_SECOND) / 100 * 100L).asInstanceOf[T]
+    }
+    private[this] val time7 = DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSSS")
+    private[this] val dateTime7 =
+      new DateTimeFormatterBuilder().append(DateTimeFormatter.ISO_LOCAL_DATE).appendLiteral(' ').append(time7).toFormatter()
+    private[this] val dateTimeOffset7 =
+      new DateTimeFormatterBuilder().append(dateTime7).appendLiteral(' ').appendOffset("+HH:MM", "+00:00").toFormatter()
+
+    class SQLServerLocalDateJdbcType extends LocalDateJdbcType {
+      override def valueToSQLLiteral(value: LocalDate) = s"(convert(date, '$value'))"
+    }
+    /* With the driver's default sendTimeAsDatetime=true, setObject would bind a LocalTime as a datetime, which
+     * rounds it to 1/300 s, so it is bound and read as a string. */
     class SQLServerLocalTimeJdbcType extends LocalTimeJdbcType {
+      private[this] def serialize(v: LocalTime) = time7.format(roundedTo100Nanos(v))
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIME(7)"
+      override def setValue(v: LocalTime, p: PreparedStatement, idx: Int): Unit = p.setString(idx, serialize(v))
+      override def getValue(r: ResultSet, idx: Int): LocalTime = r.getString(idx) match {
+        case null => null
+        case text => LocalTime.parse(text)
+      }
+      override def updateValue(v: LocalTime, r: ResultSet, idx: Int): Unit = r.updateString(idx, serialize(v))
+      override def valueToSQLLiteral(value: LocalTime) = s"(convert(time(7), '${serialize(value)}'))"
+    }
+    class SQLServerLocalDateTimeJdbcType extends LocalDateTimeJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "DATETIME2(7)"
+      override def valueToSQLLiteral(value: LocalDateTime) =
+        s"(convert(datetime2(7), '${dateTime7.format(roundedTo100Nanos(value))}'))"
+    }
+    class SQLServerInstantJdbcType extends InstantJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "DATETIMEOFFSET(7)"
+      override def valueToSQLLiteral(value: Instant) =
+        s"(convert(datetimeoffset(7), '${dateTimeOffset7.format(roundedTo100Nanos(value.atOffset(ZoneOffset.UTC)))}'))"
+    }
+    /* The driver's ResultSet.updateObject stores an OffsetDateTime with the offset +00:00, so updates are strings */
+    class SQLServerOffsetDateTimeJdbcType extends OffsetDateTimeJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "DATETIMEOFFSET(7)"
+      override def updateValue(v: OffsetDateTime, r: ResultSet, idx: Int): Unit =
+        r.updateString(idx, dateTimeOffset7.format(roundedTo100Nanos(v)))
+      override def valueToSQLLiteral(value: OffsetDateTime) =
+        s"(convert(datetimeoffset(7), '${dateTimeOffset7.format(roundedTo100Nanos(value))}'))"
+    }
+    class SQLServerZonedDateTimeJdbcType extends ZonedDateTimeJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "DATETIMEOFFSET(7)"
+      override def updateValue(v: ZonedDateTime, r: ResultSet, idx: Int): Unit =
+        r.updateString(idx, dateTimeOffset7.format(roundedTo100Nanos(v.toOffsetDateTime)))
+      override def valueToSQLLiteral(value: ZonedDateTime) =
+        s"(convert(datetimeoffset(7), '${dateTimeOffset7.format(roundedTo100Nanos(value.toOffsetDateTime))}'))"
+    }
+
+    /* The mappings of Slick 3 (useTextJavaTimeStorage) */
+
+    class LegacySQLServerLocalTimeJdbcType extends TextLocalTimeJdbcType {
       private[this] val formatter : DateTimeFormatter = {
         new DateTimeFormatterBuilder()
           .append(DateTimeFormatter.ofPattern("HH:mm:ss"))
@@ -409,11 +485,7 @@ trait SQLServerProfile extends JdbcProfile with JdbcActionComponent.MultipleRows
         s"(convert(time(6), '$value'))"
       }
     }
-    class SQLServerTimestampJdbcType extends TimestampJdbcType {
-      override def sqlTypeName(sym: Option[FieldSymbol]) = "DATETIME2(6)"
-      override def valueToSQLLiteral(value: Timestamp) = s"'$value'"
-    }
-    class SQLServerLocalDateTimeJdbcType extends LocalDateTimeJdbcType {
+    class LegacySQLServerLocalDateTimeJdbcType extends LegacyLocalDateTimeJdbcType {
       override def sqlTypeName(sym: Option[FieldSymbol]) = "DATETIME2(6)"
       override def getValue(r: ResultSet, idx: Int): LocalDateTime = {
         r.getTimestamp(idx) match {
@@ -424,7 +496,7 @@ trait SQLServerProfile extends JdbcProfile with JdbcActionComponent.MultipleRows
         }
       }
     }
-    class SQLServerInstantJdbcType extends InstantJdbcType {
+    class LegacySQLServerInstantJdbcType extends LegacyInstantJdbcType {
       private[this] val formatter : DateTimeFormatter = {
         new DateTimeFormatterBuilder()
           .append(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
@@ -458,7 +530,7 @@ trait SQLServerProfile extends JdbcProfile with JdbcActionComponent.MultipleRows
         s"(convert(datetimeoffset(6), '${serializeInstantValue(value)}'))"
       }
     }
-    class SQLServerOffsetDateTimeJdbcType extends OffsetDateTimeJdbcType {
+    class LegacySQLServerOffsetDateTimeJdbcType extends LegacyOffsetDateTimeJdbcType {
       override def sqlTypeName(sym: Option[FieldSymbol]) = "DATETIMEOFFSET(6)"
 
       private[this] val formatter: DateTimeFormatter = {

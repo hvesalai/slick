@@ -188,7 +188,28 @@ trait DB2Profile extends JdbcProfile with JdbcActionComponent.MultipleRowsPerSta
   class DB2JdbcTypes extends JdbcTypes {
     override val booleanJdbcType: DB2BooleanJdbcType = new DB2BooleanJdbcType
     override val uuidJdbcType: DB2UUIDJdbcType = new DB2UUIDJdbcType
-    override val instantType: DB2InstantJdbcType = new DB2InstantJdbcType
+    override val localDateType: LocalDateJdbcType =
+      if (useTextJavaTimeStorage) new LegacyLocalDateJdbcType else new StringBoundLocalDateJdbcType
+    override val localDateTimeType: LocalDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyLocalDateTimeJdbcType else new DB2LocalDateTimeJdbcType
+    override val instantType: InstantJdbcType =
+      if (useTextJavaTimeStorage) new LegacyDB2InstantJdbcType else new UtcTimestampInstantJdbcType(new DB2LocalDateTimeJdbcType)
+    override val offsetTimeType: OffsetTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyOffsetTimeJdbcType else new TextOffsetTimeJdbcType
+    override val offsetDateTimeType: OffsetDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyOffsetDateTimeJdbcType else new UtcTimestampOffsetDateTimeJdbcType(new DB2LocalDateTimeJdbcType)
+    override val zonedDateType: ZonedDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyZonedDateTimeJdbcType else new UtcTimestampZonedDateTimeJdbcType(new DB2LocalDateTimeJdbcType)
+    override val localTimeType: LocalTimeJdbcType = new TextLocalTimeJdbcType
+
+    /* The driver supports no java.time types. A LocalDate is bound and read as a string. The driver converts
+     * between TIMESTAMP and strings or java.sql.Timestamp in the JVM time zone, which moves a time in its DST gap,
+     * so a LocalDateTime is bound and read with a UTC Calendar. TIMESTAMP(9) keeps nanoseconds, but TIME has no
+     * fractional seconds, so a LocalTime is stored as text. There is no time zone type (on DB2 for LUW): Instant, OffsetDateTime and
+     * ZonedDateTime are stored as the date and time in UTC, and read back in UTC. */
+    class DB2LocalDateTimeJdbcType extends UtcCalendarLocalDateTimeJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP(9)"
+    }
 
     class DB2UUIDJdbcType extends UUIDJdbcType {
       override def sqlTypeName(sym: Option[FieldSymbol]) = "CHAR(16) FOR BIT DATA"
@@ -205,7 +226,7 @@ trait DB2Profile extends JdbcProfile with JdbcActionComponent.MultipleRowsPerSta
       override def valueToSQLLiteral(value: Boolean) = if(value) "1" else "0"
     }
 
-    class DB2InstantJdbcType extends InstantJdbcType {
+    class LegacyDB2InstantJdbcType extends LegacyInstantJdbcType {
       // Can't use Timestamp as the type here as subject to 2 hours DST loss each year
       override def sqlType : Int = {
         java.sql.Types.VARCHAR
