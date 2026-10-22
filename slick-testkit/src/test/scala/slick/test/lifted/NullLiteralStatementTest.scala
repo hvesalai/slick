@@ -64,8 +64,9 @@ class NullLiteralStatementTest {
     val h2 = dateTimeSql(H2Profile)
     val hsqldb = dateTimeSql(HsqldbProfile)
 
-    assertTrue(h2, h2.contains("select cast(null as DATE), cast(null as VARCHAR), cast(null as TIMESTAMP)"))
-    // HSQLDB writes java.time literals as strings, which do not match a typed NULL in a union
+    assertTrue(h2, h2.contains("select cast(null as DATE), cast(null as TIME(9)), cast(null as TIMESTAMP(9))"))
+    // With javaTimeStorage = text, HSQLDB writes java.time literals as strings, which do not match a typed NULL in a
+    // union, so these NULLs stay untyped
     assertTrue(hsqldb, hsqldb.contains("select null, null, null "))
   }
 

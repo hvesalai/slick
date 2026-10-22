@@ -59,7 +59,7 @@ class SQLiteDateStorageTest {
       bound <- db.run(ts.filter(_.ts === timestamp.bind).length.result)
       back <- db.run(ts.result.head)
     } yield {
-      assertEquals(("integer", instant.toEpochMilli, "integer", instant.toEpochMilli, "text", "2020-01-02T03:04:05Z"), raw)
+      assertEquals(("integer", instant.toEpochMilli, "integer", instant.toEpochMilli, "text", "2020-01-02T03:04:05.000000000Z"), raw)
       assertEquals("2020-01-02 03:04:05", fn)
       assertEquals(1, literal)
       assertEquals(1, bound)
@@ -76,7 +76,7 @@ class SQLiteDateStorageTest {
       bound <- db.run(ts.filter(_.ts === timestamp.bind).length.result)
       back <- db.run(ts.result.head)
     } yield {
-      assertEquals(("integer", instant.getEpochSecond, "integer", instant.getEpochSecond, "text", "2020-01-02T03:04:05Z"), raw)
+      assertEquals(("integer", instant.getEpochSecond, "integer", instant.getEpochSecond, "text", "2020-01-02T03:04:05.000000000Z"), raw)
       assertEquals("2020-01-02 03:04:05", fn)
       // Slick's literals are always milliseconds, so only bound parameters match (as documented)
       assertEquals(0, literal)

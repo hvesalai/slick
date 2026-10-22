@@ -18,7 +18,7 @@ class OracleLiteralTest {
 
   @Test def testInstantLiteralKeepsNanos(): Unit = {
     val v = LocalDateTime.of(2020, 1, 2, 3, 4, 5, 123456789).toInstant(ZoneOffset.UTC)
-    assertEquals("TO_TIMESTAMP_TZ('2020-01-02 03:04:05.123456789 +00', 'YYYY-MM-DD HH24:MI:SS.FF9 TZH')",
+    assertEquals("TO_TIMESTAMP_TZ('2020-01-02 03:04:05.123456789 +00:00', 'YYYY-MM-DD HH24:MI:SS.FF9 TZH:TZM')",
       instantType.valueToSQLLiteral(v))
   }
 

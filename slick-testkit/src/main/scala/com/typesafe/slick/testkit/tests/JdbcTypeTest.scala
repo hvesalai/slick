@@ -301,7 +301,8 @@ class JdbcTypeTest extends AsyncTest[JdbcTestDB] {
       // filter on a LiteralColumn value
       db.run(seq(
         dateTable += (values.size + 2, Some(defaultValue)),
-        dateTable.filter(_.data === LiteralColumn(defaultValue)).map(_.data).result.head.map(_ shouldBe Some(defaultValue))
+        dateTable.filter(_.data === LiteralColumn(defaultValue)).map(_.data).result.head
+          .map(dataCompareFn(values.size + 2, _, Some(defaultValue)))
       ))
     }.flatMap { _ =>
       ifCapF(jcap.mutable) {
@@ -621,6 +622,11 @@ class JdbcTypeTest extends AsyncTest[JdbcTestDB] {
     ZoneOffset.ofHoursMinutes(hours, mins)
   }
 
+  // Read back as the profile's mapping stores them (in UTC where the offset is not kept), see JavaTimeExpectations
+  private lazy val javaTime = new JavaTimeExpectations(tdb.profile)
+  private def compareAs[T](expected: T => T)(id: Int, read: Option[T], written: Option[T]): Unit =
+    (id, read) shouldBe ((id, written.map(expected)))
+
   def testOffsetTime =
     roundTrip[OffsetTime](
       List(OffsetTime.of(0, 0, 1, 746000000, ZoneOffset.ofHours(1)),
@@ -631,7 +637,8 @@ class JdbcTypeTest extends AsyncTest[JdbcTestDB] {
         generateTestLocalDateTime().atZone(ZoneId.of("Antarctica/Rothera")).toOffsetDateTime.toOffsetTime,
         generateTestLocalDateTime().atZone(ZoneId.of("Pacific/Wallis")).toOffsetDateTime.toOffsetTime,
         generateTestLocalDateTime().atZone(ZoneId.of("Africa/Johannesburg")).toOffsetDateTime.toOffsetTime),
-      () => randomLocalDateTime().atOffset(randomZoneOffset).toOffsetTime
+      () => randomLocalDateTime().atOffset(randomZoneOffset).toOffsetTime,
+      dataCompareFn = compareAs(javaTime.offsetTime)
     )
 
   def testOffsetDateTime =
@@ -644,7 +651,8 @@ class JdbcTypeTest extends AsyncTest[JdbcTestDB] {
         generateTestLocalDateTime().atZone(ZoneId.of("Africa/Addis_Ababa")).toOffsetDateTime.withHour(15),
         generateTestLocalDateTime().atZone(ZoneId.of("Pacific/Wallis")).toOffsetDateTime.withHour(15),
         generateTestLocalDateTime().atZone(ZoneId.of("Africa/Johannesburg")).toOffsetDateTime.withHour(15)),
-      () => randomLocalDateTime().atOffset(randomZoneOffset)
+      () => randomLocalDateTime().atOffset(randomZoneOffset),
+      dataCompareFn = compareAs(javaTime.offsetDateTime)
     )
 
   // the database backends that support named timezones aren't necessarily configured for all
@@ -682,7 +690,8 @@ class JdbcTypeTest extends AsyncTest[JdbcTestDB] {
       // of datetimes for each test zoneId
       (0 to 50).map(offset => baseLocalDateTime.plusMinutes(offset * 5500)).toList.
         flatMap(offsetLocalDateTime => zoneIds.map(zoneId => offsetLocalDateTime.atZone(ZoneId.of(zoneId)))),
-      generateTestZonedDateTime
+      generateTestZonedDateTime,
+      dataCompareFn = compareAs(javaTime.zonedDateTime)
     )
   }
 
