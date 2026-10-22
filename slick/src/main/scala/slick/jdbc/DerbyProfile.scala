@@ -264,7 +264,27 @@ trait DerbyProfile extends JdbcProfile with JdbcActionComponent.MultipleRowsPerS
   class DerbyJdbcTypes extends JdbcTypes {
     override val booleanJdbcType: DerbyBooleanJdbcType = new DerbyBooleanJdbcType
     override val uuidJdbcType: DerbyUUIDJdbcType = new DerbyUUIDJdbcType
-    override val instantType: DerbyInstantJdbcType = new DerbyInstantJdbcType
+    override val localDateType: LocalDateJdbcType =
+      if (useTextJavaTimeStorage) new LegacyLocalDateJdbcType else new StringBoundLocalDateJdbcType
+    override val localDateTimeType: LocalDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyLocalDateTimeJdbcType else new UtcCalendarLocalDateTimeJdbcType
+    override val instantType: InstantJdbcType =
+      if (useTextJavaTimeStorage) new LegacyDerbyInstantJdbcType else new TextInstantJdbcType
+    override val offsetTimeType: OffsetTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyOffsetTimeJdbcType else new TextOffsetTimeJdbcType
+    override val offsetDateTimeType: OffsetDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyOffsetDateTimeJdbcType else new TextOffsetDateTimeJdbcType
+    override val zonedDateType: ZonedDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyZonedDateTimeJdbcType else new TextZonedDateTimeJdbcType
+    override val localTimeType: LocalTimeJdbcType = new TextLocalTimeJdbcType
+
+    /* The driver supports no java.time types. A LocalDate is bound and read as a string. Derby converts between
+     * TIMESTAMP and strings or java.sql.Timestamp in the JVM time zone, which moves a date and time in its DST
+     * gap. setTimestamp and getTimestamp with a UTC Calendar keep it, so a LocalDateTime is bound and read that
+     * way, but Derby ignores the Calendar in a batch (e.g. ++=), and in literals. Derby has no time zone type,
+     * and an instant stored as the date and time in UTC would be moved by the same conversions, so Instant,
+     * OffsetDateTime and ZonedDateTime are stored as text in UTC, which sorts in time order. TIME has no
+     * fractional seconds, so a LocalTime is stored as text too. */
 
     /* Derby does not have a proper BOOLEAN type. The suggested workaround is
      * SMALLINT with constants 1 and 0 for TRUE and FALSE. */
@@ -279,7 +299,7 @@ trait DerbyProfile extends JdbcProfile with JdbcActionComponent.MultipleRowsPerS
         "x'" + value.toString.replace("-", "") + "'"
     }
 
-    class DerbyInstantJdbcType extends InstantJdbcType {
+    class LegacyDerbyInstantJdbcType extends LegacyInstantJdbcType {
       // Derby has no timestamp with timezone type and so using strings as timestamps are
       // susceptible to DST gaps twice a year
       override def sqlType: Int = java.sql.Types.VARCHAR

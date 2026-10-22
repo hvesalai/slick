@@ -10,6 +10,7 @@ import slick.compiler.{InsertCompiler, Phase, QueryCompiler}
 import slick.lifted.*
 import slick.relational.{CompiledMapping, RelationalProfile}
 import slick.sql.SqlProfile
+import slick.util.ConfigExtensionMethods.configExtensionMethods
 
 /** Abstract profile for accessing SQL databases via JDBC. */
 trait JdbcProfile extends SqlProfile with JdbcActionComponent
@@ -24,6 +25,13 @@ trait JdbcProfile extends SqlProfile with JdbcActionComponent
   val backend: Backend = JdbcBackend
   type ColumnType[T] = JdbcType[T]
   type BaseColumnType[T] = JdbcType[T] & BaseTypedType[T]
+  override protected lazy val javaTimeStorage: String =
+    profileConfig.getStringOpt("javaTimeStorage").getOrElse(JdbcTypesComponent.JavaTimeStorageNative) match {
+      case value @ (JdbcTypesComponent.JavaTimeStorageNative | JdbcTypesComponent.JavaTimeStorageText) => value
+      case other =>
+        throw new slick.SlickException(s"Invalid value '$other' for the configuration key javaTimeStorage of $this: " +
+          s"expected '${JdbcTypesComponent.JavaTimeStorageNative}' or '${JdbcTypesComponent.JavaTimeStorageText}'")
+    }
   val columnTypes = new JdbcTypes
   override lazy val MappedColumnType: MappedJdbcType.type = MappedJdbcType
 

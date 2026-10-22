@@ -188,7 +188,103 @@ trait HsqldbProfile extends JdbcProfile with JdbcActionComponent.MultipleRowsPer
       override def sqlTypeName(sym: Option[FieldSymbol]) = "UUID"
       override def valueToSQLLiteral(value: UUID) = s"x'${value.toString.replace("-", "")}'"
     }
-    override val localTimeType = new LocalTimeJdbcType {
+    override val localDateType: LocalDateJdbcType =
+      if (useTextJavaTimeStorage) new LegacyLocalDateJdbcType else new HsqldbLocalDateJdbcType
+    override val localTimeType: LocalTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyHsqldbLocalTimeJdbcType else new HsqldbLocalTimeJdbcType
+    override val localDateTimeType: LocalDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyLocalDateTimeJdbcType else new HsqldbLocalDateTimeJdbcType
+    override val offsetTimeType: OffsetTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyHsqldbOffsetTimeJdbcType else new HsqldbOffsetTimeJdbcType
+    override val offsetDateTimeType: OffsetDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyHsqldbOffsetDateTimeJdbcType else new HsqldbOffsetDateTimeJdbcType
+    override val instantType: InstantJdbcType =
+      if (useTextJavaTimeStorage) new LegacyHsqldbInstantJdbcType else new HsqldbInstantJdbcType
+    override val zonedDateType: ZonedDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyZonedDateTimeJdbcType else new HsqldbZonedDateTimeJdbcType
+
+    /* HSQLDB keeps nanoseconds with a precision of 9 (its TIME has no fractional seconds by default), and the
+     * WITH TIME ZONE types keep the offset, but not the zone region of a ZonedDateTime. The values are bound with
+     * setObject. They are read with getString, because a bound value in a select list is a VARCHAR, which
+     * getObject cannot convert. Literals are typed: HSQLDB makes a TIMESTAMP or TIME literal with an offset a
+     * WITH TIME ZONE value (it does not accept the WITH TIME ZONE literal syntax). */
+
+    /** Adds the leading zero that HSQLDB leaves out of the hour of a time and of an offset, e.g.
+      * `2:34:56.5+5:30` becomes `02:34:56.5+05:30`. */
+    private[this] def hsqldbToIso(text: String): String = {
+      def padHour(m: scala.util.matching.Regex.Match) = m.group(1) + "0" + m.group(2)
+
+      HsqldbOffsetHour.replaceAllIn(HsqldbTimeHour.replaceAllIn(text, m => padHour(m)), m => padHour(m))
+    }
+    /** An hour without its leading zero at the start of a time, after a date or at the start of the text */
+    private[this] val HsqldbTimeHour = """(^|[ T])(\d:\d\d:)""".r
+    /** An offset hour without its leading zero at the end of the text */
+    private[this] val HsqldbOffsetHour = """([+-])(\d:\d\d)$""".r
+    private[this] val offsetDateTimeParser =
+      new DateTimeFormatterBuilder().append(JavaTimeFormats.localDateTimeParser).appendOffsetId().toFormatter()
+
+    class HsqldbLocalDateJdbcType extends LocalDateJdbcType {
+      override def getValue(r: ResultSet, idx: Int): LocalDate = r.getString(idx) match {
+        case null => null
+        case text => LocalDate.parse(text)
+      }
+      override def valueToSQLLiteral(value: LocalDate) = s"DATE '$value'"
+    }
+    class HsqldbLocalTimeJdbcType extends LocalTimeJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIME(9)"
+      override def getValue(r: ResultSet, idx: Int): LocalTime = r.getString(idx) match {
+        case null => null
+        case text => LocalTime.parse(hsqldbToIso(text))
+      }
+      override def valueToSQLLiteral(value: LocalTime) = s"TIME '${JavaTimeFormats.localTime.format(value)}'"
+    }
+    class HsqldbLocalDateTimeJdbcType extends LocalDateTimeJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP(9)"
+      override def getValue(r: ResultSet, idx: Int): LocalDateTime = r.getString(idx) match {
+        case null => null
+        case text => LocalDateTime.parse(hsqldbToIso(text), JavaTimeFormats.localDateTimeParser)
+      }
+      override def valueToSQLLiteral(value: LocalDateTime) = s"TIMESTAMP '${JavaTimeFormats.localDateTime.format(value)}'"
+    }
+    class HsqldbInstantJdbcType extends InstantJdbcType {
+      private[this] val offsetDateTime = new HsqldbOffsetDateTimeJdbcType
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP(9) WITH TIME ZONE"
+      override def getValue(r: ResultSet, idx: Int): Instant = offsetDateTime.getValue(r, idx) match {
+        case null  => null
+        case value => value.toInstant
+      }
+      override def valueToSQLLiteral(value: Instant) = offsetDateTime.valueToSQLLiteral(value.atOffset(ZoneOffset.UTC))
+    }
+    class HsqldbOffsetTimeJdbcType extends OffsetTimeJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIME(9) WITH TIME ZONE"
+      override def getValue(r: ResultSet, idx: Int): OffsetTime = r.getString(idx) match {
+        case null => null
+        // HSQLDB writes midnight in a time with an offset as 24:00
+        case text => OffsetTime.parse(hsqldbToIso(text).replaceFirst("^24:", "00:"))
+      }
+      override def valueToSQLLiteral(value: OffsetTime) = s"TIME '${JavaTimeFormats.offsetTime.format(value)}'"
+    }
+    class HsqldbOffsetDateTimeJdbcType extends OffsetDateTimeJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP(9) WITH TIME ZONE"
+      override def getValue(r: ResultSet, idx: Int): OffsetDateTime = r.getString(idx) match {
+        case null => null
+        case text => OffsetDateTime.parse(hsqldbToIso(text), offsetDateTimeParser)
+      }
+      override def valueToSQLLiteral(value: OffsetDateTime) = s"TIMESTAMP '${JavaTimeFormats.offsetDateTime.format(value)}'"
+    }
+    class HsqldbZonedDateTimeJdbcType extends ZonedDateTimeJdbcType {
+      private[this] val offsetDateTime = new HsqldbOffsetDateTimeJdbcType
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP(9) WITH TIME ZONE"
+      override def getValue(r: ResultSet, idx: Int): ZonedDateTime = offsetDateTime.getValue(r, idx) match {
+        case null  => null
+        case value => value.toZonedDateTime
+      }
+      override def valueToSQLLiteral(value: ZonedDateTime) = offsetDateTime.valueToSQLLiteral(value.toOffsetDateTime)
+    }
+
+    /* The mappings of Slick 3 (useTextJavaTimeStorage) */
+
+    class LegacyHsqldbLocalTimeJdbcType extends TextLocalTimeJdbcType {
       override def sqlType = java.sql.Types.TIME
 
       override def sqlTypeName(sym: Option[FieldSymbol]) = "TIME(3)"
@@ -204,11 +300,6 @@ trait HsqldbProfile extends JdbcProfile with JdbcActionComponent.MultipleRowsPer
         }
       }
     }
-
-    override val offsetTimeType: HsqldbOffsetTimeJdbcType = new HsqldbOffsetTimeJdbcType
-    override val offsetDateTimeType: HsqldbOffsetDateTimeJdbcType = new HsqldbOffsetDateTimeJdbcType
-    override val instantType: HsqldbInstantJdbcType = new HsqldbInstantJdbcType
-
 
     /**
      * HSQLDB uses a non-standard string representation of timestamps.
@@ -255,7 +346,7 @@ trait HsqldbProfile extends JdbcProfile with JdbcActionComponent.MultipleRowsPer
       }
     }
 
-    class HsqldbOffsetTimeJdbcType extends OffsetTimeJdbcType with HsqldbTimeJdbcTypeWithOffset {
+    class LegacyHsqldbOffsetTimeJdbcType extends LegacyOffsetTimeJdbcType with HsqldbTimeJdbcTypeWithOffset {
 
       override def sqlType = java.sql.Types.TIME_WITH_TIMEZONE
 
@@ -293,7 +384,7 @@ trait HsqldbProfile extends JdbcProfile with JdbcActionComponent.MultipleRowsPer
         s"'${offsetConvertISOToHsqldb(v.format(timeFormatter))}'"
     }
 
-    class HsqldbOffsetDateTimeJdbcType extends OffsetDateTimeJdbcType with HsqldbTimeJdbcTypeWithOffset {
+    class LegacyHsqldbOffsetDateTimeJdbcType extends LegacyOffsetDateTimeJdbcType with HsqldbTimeJdbcTypeWithOffset {
 
       override def sqlType = java.sql.Types.TIMESTAMP_WITH_TIMEZONE
 
@@ -323,7 +414,7 @@ trait HsqldbProfile extends JdbcProfile with JdbcActionComponent.MultipleRowsPer
       override def valueToSQLLiteral(v: OffsetDateTime): String =
         s"'${offsetConvertISOToHsqldb(v.format(datetimeFormatter))}'"
     }
-    class HsqldbInstantJdbcType extends InstantJdbcType with HsqldbTimeJdbcTypeWithOffset {
+    class LegacyHsqldbInstantJdbcType extends LegacyInstantJdbcType with HsqldbTimeJdbcTypeWithOffset {
       override def sqlType = java.sql.Types.TIMESTAMP_WITH_TIMEZONE
       override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP(9) WITH TIME ZONE"
       override val hasLiteralForm: Boolean = false

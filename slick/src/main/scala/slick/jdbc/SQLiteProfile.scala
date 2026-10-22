@@ -83,7 +83,9 @@ import slick.util.QueryInterpolator.queryInterpolator
   * <code>LocalDate</code>, <code>LocalDateTime</code> and <code>Instant</code>, which Slick maps through them)
   * as INTEGER milliseconds since the Unix epoch, and Slick renders literals of these types in the same way.
   * <code>LocalTime</code>, <code>OffsetTime</code>, <code>OffsetDateTime</code> and <code>ZonedDateTime</code>
-  * are stored as ISO-8601 TEXT. SQLite's own date and time functions expect seconds (or text), so use e.g.
+  * are stored as ISO-8601 TEXT. The last three are normalized to UTC (the offset and zone are not kept) and
+  * written with a fixed width, so that they sort in time order. SQLite's own date and time functions expect
+  * seconds (or text), so use e.g.
   * <code>datetime(col / 1000, 'unixepoch')</code> on the millisecond values. The driver properties
   * <code>date_precision = SECONDS</code> and <code>date_class</code> change how bound parameters are stored
   * and read, but not Slick's literals, so with them date/time values in queries must be bound parameters
@@ -338,6 +340,13 @@ trait SQLiteProfile extends JdbcProfile with JdbcActionComponent.MultipleRowsPer
     override val localDateType: SQLiteLocalDateJdbcType = new SQLiteLocalDateJdbcType
     override val localDateTimeType: SQLiteLocalDateTimeJdbcType = new SQLiteLocalDateTimeJdbcType
     override val instantType: SQLiteInstantJdbcType = new SQLiteInstantJdbcType
+    override val localTimeType: LocalTimeJdbcType = new TextLocalTimeJdbcType
+    override val offsetTimeType: OffsetTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyOffsetTimeJdbcType else new TextOffsetTimeJdbcType
+    override val offsetDateTimeType: OffsetDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyOffsetDateTimeJdbcType else new TextOffsetDateTimeJdbcType
+    override val zonedDateType: ZonedDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyZonedDateTimeJdbcType else new TextZonedDateTimeJdbcType
     override val timeJdbcType: SQLiteTimeJdbcType = new SQLiteTimeJdbcType
     override val timestampJdbcType: SQLiteTimestampJdbcType = new SQLiteTimestampJdbcType
     override val uuidJdbcType: SQLiteUUIDJdbcType = new SQLiteUUIDJdbcType
@@ -357,17 +366,17 @@ trait SQLiteProfile extends JdbcProfile with JdbcActionComponent.MultipleRowsPer
         value.getTime.toString
       }
     }
-    class SQLiteLocalDateJdbcType extends LocalDateJdbcType {
+    class SQLiteLocalDateJdbcType extends LegacyLocalDateJdbcType {
       override def valueToSQLLiteral(value: LocalDate) = {
         Date.valueOf(value).getTime.toString
       }
     }
-    class SQLiteInstantJdbcType extends InstantJdbcType {
+    class SQLiteInstantJdbcType extends LegacyInstantJdbcType {
       override def valueToSQLLiteral(value: Instant) = {
         value.toEpochMilli.toString
       }
     }
-    class SQLiteLocalDateTimeJdbcType extends LocalDateTimeJdbcType {
+    class SQLiteLocalDateTimeJdbcType extends LegacyLocalDateTimeJdbcType {
       override def valueToSQLLiteral(value: LocalDateTime) = {
         Timestamp.valueOf(value).getTime.toString
       }

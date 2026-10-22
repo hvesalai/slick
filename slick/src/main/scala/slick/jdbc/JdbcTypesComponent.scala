@@ -2,9 +2,9 @@ package slick.jdbc
 
 import java.sql.{Array as _, *}
 import java.time.*
-import java.time.format.DateTimeFormatterBuilder
+import java.time.format.{DateTimeFormatter, DateTimeFormatterBuilder}
 import java.time.temporal.ChronoField
-import java.util.UUID
+import java.util.{Calendar, TimeZone, UUID}
 
 import scala.reflect.ClassTag
 
@@ -13,6 +13,16 @@ import slick.ast.*
 import slick.relational.{RelationalProfile, RelationalTypesComponent}
 
 trait JdbcTypesComponent extends RelationalTypesComponent { self: JdbcProfile =>
+
+  /** How this profile stores the java.time types: `native` (the default) uses the database's own date and
+    * time types where it has them, `text` the mappings of Slick 3, which store several types as text, for
+    * databases with tables created by Slick 3 that cannot be migrated yet. It is read from the profile
+    * configuration key `javaTimeStorage`, e.g. `slick.jdbc.MySQLProfile.javaTimeStorage = text`. */
+  protected def javaTimeStorage: String
+
+  /** Whether [[javaTimeStorage]] is `text`, i.e. the java.time types use the mappings of Slick 3 */
+  protected final def useTextJavaTimeStorage: Boolean =
+    this.javaTimeStorage == JdbcTypesComponent.JavaTimeStorageText
 
   abstract class MappedJdbcType[T, U](implicit val tmd: JdbcType[U], val classTag: ClassTag[T]) extends JdbcType[T] {
     def map(t: T): U
@@ -83,6 +93,8 @@ trait JdbcTypesComponent extends RelationalTypesComponent { self: JdbcProfile =>
       val size = sym.flatMap(_.findColumnOption[RelationalProfile.ColumnOption.Length])
       size.fold("VARCHAR(254)")(l => if(l.varying) s"VARCHAR(${l.length})" else s"CHAR(${l.length})")
     case java.sql.Types.DECIMAL => "DECIMAL(21,2)"
+    case java.sql.Types.TIME_WITH_TIMEZONE => "TIME WITH TIME ZONE"
+    case java.sql.Types.TIMESTAMP_WITH_TIMEZONE => "TIMESTAMP WITH TIME ZONE"
     case t => JdbcTypesComponent.typeNames.getOrElse(t,
       throw new SlickException("No SQL type name found in java.sql.Types for code "+t))
   }
@@ -106,13 +118,20 @@ trait JdbcTypesComponent extends RelationalTypesComponent { self: JdbcProfile =>
     val charJdbcType = new CharJdbcType
     val clobJdbcType = new ClobJdbcType
     val dateJdbcType = new DateJdbcType
-    val offsetDateTimeType = new OffsetDateTimeJdbcType
-    val zonedDateType = new ZonedDateTimeJdbcType
-    val localTimeType = new LocalTimeJdbcType
-    val localDateType = new LocalDateJdbcType
-    val localDateTimeType = new LocalDateTimeJdbcType
-    val offsetTimeType = new OffsetTimeJdbcType
-    val instantType = new InstantJdbcType
+    val offsetDateTimeType: OffsetDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyOffsetDateTimeJdbcType else new OffsetDateTimeJdbcType
+    val zonedDateType: ZonedDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyZonedDateTimeJdbcType else new ZonedDateTimeJdbcType
+    val localTimeType: LocalTimeJdbcType =
+      if (useTextJavaTimeStorage) new TextLocalTimeJdbcType else new LocalTimeJdbcType
+    val localDateType: LocalDateJdbcType =
+      if (useTextJavaTimeStorage) new LegacyLocalDateJdbcType else new LocalDateJdbcType
+    val localDateTimeType: LocalDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyLocalDateTimeJdbcType else new LocalDateTimeJdbcType
+    val offsetTimeType: OffsetTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyOffsetTimeJdbcType else new OffsetTimeJdbcType
+    val instantType: InstantJdbcType =
+      if (useTextJavaTimeStorage) new LegacyInstantJdbcType else new InstantJdbcType
     val doubleJdbcType = new DoubleJdbcType
     val floatJdbcType = new FloatJdbcType
     val intJdbcType = new IntJdbcType
@@ -188,10 +207,239 @@ trait JdbcTypesComponent extends RelationalTypesComponent { self: JdbcProfile =>
       override def valueToSQLLiteral(value: Date) = s"{d '${value.toString}'}"
     }
 
+    /* The java.time types. The classes named after the types (e.g. InstantJdbcType) bind and read the
+     * values with the JDBC 4.2 methods setObject and getObject. The profiles override them where the
+     * database or its driver needs something else. The Text* classes store a value as text, the
+     * StringBound* and UtcCalendar* classes bind and read a native DATE or TIMESTAMP column for drivers
+     * without java.time support, the UtcTimestamp* classes store an instant as the date and time in UTC
+     * for databases without a time zone type, and the Legacy* classes are the mappings of Slick 3, which
+     * a profile uses with `javaTimeStorage = text`. Only the Legacy* classes depend on the JVM time zone. */
+
     class LocalDateJdbcType extends DriverJdbcType[LocalDate] {
-      // TODO: Use native Instant JDBC methods as soon they are implemented.
-      // https://java.net/jira/browse/JPA_SPEC-63
-      override def sqlType : Int = java.sql.Types.DATE
+      override def sqlType: Int = java.sql.Types.DATE
+      override def setValue(v: LocalDate, p: PreparedStatement, idx: Int): Unit = p.setObject(idx, v)
+      override def getValue(r: ResultSet, idx: Int): LocalDate = r.getObject(idx, classOf[LocalDate])
+      override def updateValue(v: LocalDate, r: ResultSet, idx: Int): Unit = r.updateObject(idx, v)
+      override def valueToSQLLiteral(value: LocalDate) = s"'${value.toString}'"
+    }
+
+    class LocalTimeJdbcType extends DriverJdbcType[LocalTime] {
+      override def sqlType: Int = java.sql.Types.TIME
+      override def setValue(v: LocalTime, p: PreparedStatement, idx: Int): Unit = p.setObject(idx, v)
+      override def getValue(r: ResultSet, idx: Int): LocalTime = r.getObject(idx, classOf[LocalTime])
+      override def updateValue(v: LocalTime, r: ResultSet, idx: Int): Unit = r.updateObject(idx, v)
+      override def valueToSQLLiteral(value: LocalTime) = s"'${JavaTimeFormats.localTime.format(value)}'"
+    }
+
+    class LocalDateTimeJdbcType extends DriverJdbcType[LocalDateTime] {
+      override def sqlType: Int = java.sql.Types.TIMESTAMP
+      override def setValue(v: LocalDateTime, p: PreparedStatement, idx: Int): Unit = p.setObject(idx, v)
+      override def getValue(r: ResultSet, idx: Int): LocalDateTime = r.getObject(idx, classOf[LocalDateTime])
+      override def updateValue(v: LocalDateTime, r: ResultSet, idx: Int): Unit = r.updateObject(idx, v)
+      override def valueToSQLLiteral(value: LocalDateTime) = s"'${JavaTimeFormats.localDateTime.format(value)}'"
+    }
+
+    /** An [[Instant]] in a TIMESTAMP WITH TIME ZONE column. It is bound as an [[OffsetDateTime]] in UTC,
+      * because JDBC 4.2 has no mapping for Instant. */
+    class InstantJdbcType extends DriverJdbcType[Instant] {
+      override def sqlType: Int = java.sql.Types.TIMESTAMP_WITH_TIMEZONE
+      override def setValue(v: Instant, p: PreparedStatement, idx: Int): Unit = p.setObject(idx, v.atOffset(ZoneOffset.UTC))
+      override def getValue(r: ResultSet, idx: Int): Instant = r.getObject(idx, classOf[OffsetDateTime]) match {
+        case null  => null
+        case value => value.toInstant
+      }
+      override def updateValue(v: Instant, r: ResultSet, idx: Int): Unit = r.updateObject(idx, v.atOffset(ZoneOffset.UTC))
+      override def valueToSQLLiteral(value: Instant) =
+        s"TIMESTAMP WITH TIME ZONE '${JavaTimeFormats.offsetDateTime.format(value.atOffset(ZoneOffset.UTC))}'"
+    }
+
+    class OffsetTimeJdbcType extends DriverJdbcType[OffsetTime] {
+      override def sqlType: Int = java.sql.Types.TIME_WITH_TIMEZONE
+      override def setValue(v: OffsetTime, p: PreparedStatement, idx: Int): Unit = p.setObject(idx, v)
+      override def getValue(r: ResultSet, idx: Int): OffsetTime = r.getObject(idx, classOf[OffsetTime])
+      override def updateValue(v: OffsetTime, r: ResultSet, idx: Int): Unit = r.updateObject(idx, v)
+      override def valueToSQLLiteral(value: OffsetTime) =
+        s"TIME WITH TIME ZONE '${JavaTimeFormats.offsetTime.format(value)}'"
+    }
+
+    class OffsetDateTimeJdbcType extends DriverJdbcType[OffsetDateTime] {
+      override def sqlType: Int = java.sql.Types.TIMESTAMP_WITH_TIMEZONE
+      override def setValue(v: OffsetDateTime, p: PreparedStatement, idx: Int): Unit = p.setObject(idx, v)
+      override def getValue(r: ResultSet, idx: Int): OffsetDateTime = r.getObject(idx, classOf[OffsetDateTime])
+      override def updateValue(v: OffsetDateTime, r: ResultSet, idx: Int): Unit = r.updateObject(idx, v)
+      override def valueToSQLLiteral(value: OffsetDateTime) =
+        s"TIMESTAMP WITH TIME ZONE '${JavaTimeFormats.offsetDateTime.format(value)}'"
+    }
+
+    /** A [[ZonedDateTime]] in a TIMESTAMP WITH TIME ZONE column. It is bound as an [[OffsetDateTime]], because
+      * JDBC 4.2 has no mapping for ZonedDateTime, so the zone region is lost: the value is read back with its
+      * offset as the zone. */
+    class ZonedDateTimeJdbcType extends DriverJdbcType[ZonedDateTime] {
+      override def sqlType: Int = java.sql.Types.TIMESTAMP_WITH_TIMEZONE
+      override def setValue(v: ZonedDateTime, p: PreparedStatement, idx: Int): Unit = p.setObject(idx, v.toOffsetDateTime)
+      override def getValue(r: ResultSet, idx: Int): ZonedDateTime = r.getObject(idx, classOf[OffsetDateTime]) match {
+        case null  => null
+        case value => value.toZonedDateTime
+      }
+      override def updateValue(v: ZonedDateTime, r: ResultSet, idx: Int): Unit = r.updateObject(idx, v.toOffsetDateTime)
+      override def valueToSQLLiteral(value: ZonedDateTime) =
+        s"TIMESTAMP WITH TIME ZONE '${JavaTimeFormats.offsetDateTime.format(value)}'"
+    }
+
+    /** A [[LocalTime]] stored as text, for databases without a TIME type that keeps fractional seconds. The
+      * format, `HH:mm:ss` with only as many fractional digits as needed, is canonical and sorts in time
+      * order. It is also the LocalTime mapping of Slick 3. */
+    class TextLocalTimeJdbcType extends LocalTimeJdbcType {
+      override def sqlType: Int = java.sql.Types.VARCHAR
+      override def setValue(v: LocalTime, p: PreparedStatement, idx: Int): Unit =
+        p.setString(idx, JavaTimeFormats.localTime.format(v))
+      override def getValue(r: ResultSet, idx: Int): LocalTime = r.getString(idx) match {
+        case null => null
+        case iso8601String => LocalTime.parse(iso8601String)
+      }
+      override def updateValue(v: LocalTime, r: ResultSet, idx: Int): Unit =
+        r.updateString(idx, JavaTimeFormats.localTime.format(v))
+      override def valueToSQLLiteral(value: LocalTime) = s"'${JavaTimeFormats.localTime.format(value)}'"
+    }
+
+    /** An [[OffsetTime]] stored as text, for databases without a time type that keeps an offset. The value is
+      * normalized to UTC (12:00+02:00 is stored as 10:00Z and read back as 10:00Z), and written with a fixed
+      * width, so that the text sorts in time order. Values written by Slick 3, with their own offsets, are read
+      * and normalized too. */
+    class TextOffsetTimeJdbcType extends OffsetTimeJdbcType {
+      override def sqlType: Int = java.sql.Types.VARCHAR
+      protected def serialize(v: OffsetTime): String =
+        JavaTimeFormats.utcTime.format(v.withOffsetSameInstant(ZoneOffset.UTC))
+      override def setValue(v: OffsetTime, p: PreparedStatement, idx: Int): Unit = p.setString(idx, serialize(v))
+      override def getValue(r: ResultSet, idx: Int): OffsetTime = r.getString(idx) match {
+        case null => null
+        case text => OffsetTime.parse(text).withOffsetSameInstant(ZoneOffset.UTC)
+      }
+      override def updateValue(v: OffsetTime, r: ResultSet, idx: Int): Unit = r.updateString(idx, serialize(v))
+      override def valueToSQLLiteral(value: OffsetTime) = s"'${serialize(value)}'"
+    }
+
+    /** An [[Instant]] stored as text in UTC, with a fixed width, so that the text sorts in time order. Values
+      * written by Slick 3 (`Instant.toString`) are read too. */
+    class TextInstantJdbcType extends InstantJdbcType {
+      override def sqlType: Int = java.sql.Types.VARCHAR
+      protected def serialize(v: Instant): String = JavaTimeFormats.utcDateTime.format(v)
+      override def setValue(v: Instant, p: PreparedStatement, idx: Int): Unit = p.setString(idx, serialize(v))
+      override def getValue(r: ResultSet, idx: Int): Instant = r.getString(idx) match {
+        case null => null
+        case text => Instant.parse(text)
+      }
+      override def updateValue(v: Instant, r: ResultSet, idx: Int): Unit = r.updateString(idx, serialize(v))
+      override def valueToSQLLiteral(value: Instant) = s"'${serialize(value)}'"
+    }
+
+    /** An [[OffsetDateTime]] stored as text, normalized to UTC like [[TextOffsetTimeJdbcType]]. */
+    class TextOffsetDateTimeJdbcType extends OffsetDateTimeJdbcType {
+      override def sqlType: Int = java.sql.Types.VARCHAR
+      protected def serialize(v: OffsetDateTime): String = JavaTimeFormats.utcDateTime.format(v.toInstant)
+      override def setValue(v: OffsetDateTime, p: PreparedStatement, idx: Int): Unit = p.setString(idx, serialize(v))
+      override def getValue(r: ResultSet, idx: Int): OffsetDateTime = r.getString(idx) match {
+        case null => null
+        case text => OffsetDateTime.parse(text).withOffsetSameInstant(ZoneOffset.UTC)
+      }
+      override def updateValue(v: OffsetDateTime, r: ResultSet, idx: Int): Unit = r.updateString(idx, serialize(v))
+      override def valueToSQLLiteral(value: OffsetDateTime) = s"'${serialize(value)}'"
+    }
+
+    /** A [[ZonedDateTime]] stored as text, normalized to UTC like [[TextOffsetTimeJdbcType]]: the zone region
+      * is lost, and the value is read back with the zone [[ZoneOffset.UTC]]. */
+    class TextZonedDateTimeJdbcType extends ZonedDateTimeJdbcType {
+      override def sqlType: Int = java.sql.Types.VARCHAR
+      protected def serialize(v: ZonedDateTime): String = JavaTimeFormats.utcDateTime.format(v.toInstant)
+      override def setValue(v: ZonedDateTime, p: PreparedStatement, idx: Int): Unit = p.setString(idx, serialize(v))
+      override def getValue(r: ResultSet, idx: Int): ZonedDateTime = r.getString(idx) match {
+        case null => null
+        case text => ZonedDateTime.parse(text).withZoneSameInstant(ZoneOffset.UTC)
+      }
+      override def updateValue(v: ZonedDateTime, r: ResultSet, idx: Int): Unit = r.updateString(idx, serialize(v))
+      override def valueToSQLLiteral(value: ZonedDateTime) = s"'${serialize(value)}'"
+    }
+
+    /** A [[LocalDate]] in a DATE column, bound and read as a `yyyy-MM-dd` string, for drivers that support
+      * no java.time types. */
+    class StringBoundLocalDateJdbcType extends LocalDateJdbcType {
+      override def setValue(v: LocalDate, p: PreparedStatement, idx: Int): Unit = p.setString(idx, v.toString)
+      override def getValue(r: ResultSet, idx: Int): LocalDate = r.getString(idx) match {
+        case null => null
+        case text => LocalDate.parse(text.substring(0, 10))
+      }
+      override def updateValue(v: LocalDate, r: ResultSet, idx: Int): Unit = r.updateString(idx, v.toString)
+    }
+
+    /** A [[LocalDateTime]] in a TIMESTAMP column, bound and read as a java.sql.Timestamp of the same date and time
+      * in UTC, with a UTC Calendar, for drivers that support no java.time types. The driver then converts the
+      * date and time in UTC, which has no DST gaps, rather than in the JVM time zone, in which a time in a DST gap
+      * would move by an hour. ResultSet.updateTimestamp takes no Calendar, so an update of a mutable result set
+      * binds a string, which the driver may convert in the JVM time zone. */
+    class UtcCalendarLocalDateTimeJdbcType extends LocalDateTimeJdbcType {
+      private[this] def utcCalendar = Calendar.getInstance(TimeZone.getTimeZone(ZoneOffset.UTC))
+      override def setValue(v: LocalDateTime, p: PreparedStatement, idx: Int): Unit =
+        p.setTimestamp(idx, Timestamp.from(v.toInstant(ZoneOffset.UTC)), utcCalendar)
+      override def getValue(r: ResultSet, idx: Int): LocalDateTime = r.getTimestamp(idx, utcCalendar) match {
+        case null  => null
+        case value => LocalDateTime.ofInstant(value.toInstant, ZoneOffset.UTC)
+      }
+      override def updateValue(v: LocalDateTime, r: ResultSet, idx: Int): Unit =
+        r.updateString(idx, JavaTimeFormats.localDateTime.format(v))
+    }
+
+    /** An [[Instant]] in a TIMESTAMP column (without time zone) that holds the date and time in UTC, for
+      * databases without a time zone type. `utc` binds and reads the UTC date and time. */
+    class UtcTimestampInstantJdbcType(utc: LocalDateTimeJdbcType) extends InstantJdbcType {
+      override def sqlType: Int = utc.sqlType
+      override def sqlTypeName(sym: Option[FieldSymbol]): String = utc.sqlTypeName(sym)
+      override def setValue(v: Instant, p: PreparedStatement, idx: Int): Unit =
+        utc.setValue(LocalDateTime.ofInstant(v, ZoneOffset.UTC), p, idx)
+      override def getValue(r: ResultSet, idx: Int): Instant = utc.getValue(r, idx) match {
+        case null  => null
+        case value => value.toInstant(ZoneOffset.UTC)
+      }
+      override def updateValue(v: Instant, r: ResultSet, idx: Int): Unit =
+        utc.updateValue(LocalDateTime.ofInstant(v, ZoneOffset.UTC), r, idx)
+      override def hasLiteralForm: Boolean = utc.hasLiteralForm
+      override def valueToSQLLiteral(value: Instant) = utc.valueToSQLLiteral(LocalDateTime.ofInstant(value, ZoneOffset.UTC))
+    }
+
+    /** An [[OffsetDateTime]] in a TIMESTAMP column (without time zone) that holds the date and time in UTC, like
+      * [[UtcTimestampInstantJdbcType]]. The value is read back in UTC. */
+    class UtcTimestampOffsetDateTimeJdbcType(utc: LocalDateTimeJdbcType) extends OffsetDateTimeJdbcType {
+      private val instant = new UtcTimestampInstantJdbcType(utc)
+      override def sqlType: Int = utc.sqlType
+      override def sqlTypeName(sym: Option[FieldSymbol]): String = utc.sqlTypeName(sym)
+      override def setValue(v: OffsetDateTime, p: PreparedStatement, idx: Int): Unit = instant.setValue(v.toInstant, p, idx)
+      override def getValue(r: ResultSet, idx: Int): OffsetDateTime = instant.getValue(r, idx) match {
+        case null  => null
+        case value => value.atOffset(ZoneOffset.UTC)
+      }
+      override def updateValue(v: OffsetDateTime, r: ResultSet, idx: Int): Unit = instant.updateValue(v.toInstant, r, idx)
+      override def hasLiteralForm: Boolean = utc.hasLiteralForm
+      override def valueToSQLLiteral(value: OffsetDateTime) = instant.valueToSQLLiteral(value.toInstant)
+    }
+
+    /** A [[ZonedDateTime]] in a TIMESTAMP column (without time zone) that holds the date and time in UTC, like
+      * [[UtcTimestampInstantJdbcType]]. The value is read back with the zone [[ZoneOffset.UTC]]. */
+    class UtcTimestampZonedDateTimeJdbcType(utc: LocalDateTimeJdbcType) extends ZonedDateTimeJdbcType {
+      private val instant = new UtcTimestampInstantJdbcType(utc)
+      override def sqlType: Int = utc.sqlType
+      override def sqlTypeName(sym: Option[FieldSymbol]): String = utc.sqlTypeName(sym)
+      override def setValue(v: ZonedDateTime, p: PreparedStatement, idx: Int): Unit = instant.setValue(v.toInstant, p, idx)
+      override def getValue(r: ResultSet, idx: Int): ZonedDateTime = instant.getValue(r, idx) match {
+        case null  => null
+        case value => value.atZone(ZoneOffset.UTC)
+      }
+      override def updateValue(v: ZonedDateTime, r: ResultSet, idx: Int): Unit = instant.updateValue(v.toInstant, r, idx)
+      override def hasLiteralForm: Boolean = utc.hasLiteralForm
+      override def valueToSQLLiteral(value: ZonedDateTime) = instant.valueToSQLLiteral(value.toInstant)
+    }
+
+    /* The java.time mappings of Slick 3, used when `useTextJavaTimeStorage` is set */
+
+    class LegacyLocalDateJdbcType extends LocalDateJdbcType {
       override def setValue(v: LocalDate, p: PreparedStatement, idx: Int) : Unit = {
         p.setDate(idx, Date.valueOf(v))
       }
@@ -209,45 +457,7 @@ trait JdbcTypesComponent extends RelationalTypesComponent { self: JdbcProfile =>
       }
     }
 
-    class LocalTimeJdbcType extends DriverJdbcType[LocalTime] {
-      override def sqlType : Int = {
-        /**
-         * [[LocalTime]] will be persisted as a [[java.sql.Types.VARCHAR]] in order to
-         * avoid losing precision, because the ANSI SQL type ([[java.sql.Types.TIME]]) stores
-         * TIME with second precision, while [[LocalTime]] stores it with a millisecond one.
-         */
-        java.sql.Types.VARCHAR
-      }
-      override def setValue(v: LocalTime, p: PreparedStatement, idx: Int) : Unit = {
-        p.setString(idx, localTimeFormatter.format(v))
-      }
-      override def getValue(r: ResultSet, idx: Int) : LocalTime = {
-        r.getString(idx) match {
-          case null => null
-          case iso8601String => LocalTime.parse(iso8601String)
-        }
-      }
-      override def updateValue(v: LocalTime, r: ResultSet, idx: Int) = {
-        r.updateString(idx, localTimeFormatter.format(v))
-      }
-
-      override def valueToSQLLiteral(value: LocalTime) = {
-        s"'${localTimeFormatter.format(value)}'"
-      }
-
-      private[this] val localTimeFormatter =
-        new DateTimeFormatterBuilder()
-          .appendPattern("HH:mm:ss")
-          .optionalStart()
-          .appendFraction(ChronoField.NANO_OF_SECOND, 0, 9, true)
-          .optionalEnd()
-          .toFormatter()
-    }
-
-    class LocalDateTimeJdbcType extends DriverJdbcType[LocalDateTime] {
-      // TODO: Use native Instant JDBC methods as soon they are implemented.
-      // https://java.net/jira/browse/JPA_SPEC-63
-      override def sqlType : Int = java.sql.Types.TIMESTAMP
+    class LegacyLocalDateTimeJdbcType extends LocalDateTimeJdbcType {
       override def setValue(v: LocalDateTime, p: PreparedStatement, idx: Int) : Unit = {
         p.setTimestamp(idx, Timestamp.valueOf(v))
       }
@@ -265,9 +475,7 @@ trait JdbcTypesComponent extends RelationalTypesComponent { self: JdbcProfile =>
       }
     }
 
-    class InstantJdbcType extends DriverJdbcType[Instant] {
-      // TODO: Use native Instant JDBC methods as soon they are implemented.
-      // https://java.net/jira/browse/JPA_SPEC-63
+    class LegacyInstantJdbcType extends InstantJdbcType {
       override def sqlType : Int = {
         java.sql.Types.TIMESTAMP
       }
@@ -288,19 +496,8 @@ trait JdbcTypesComponent extends RelationalTypesComponent { self: JdbcProfile =>
       }
     }
 
-    class OffsetTimeJdbcType extends DriverJdbcType[OffsetTime] {
-      // TODO: Use native Instant JDBC methods as soon they are implemented.
-      // https://java.net/jira/browse/JPA_SPEC-63
-      override def sqlType : Int = {
-        /**
-          * Stores the [[OffsetTime]] as a 'VARCHAR' on databases, like SQLite, with no
-          * specific 'TIME' implementations. An example persisted value would be '18:22:43.417+01:00'.
-          * This is done because the standard data type 'TIME WITH TIMEZONE' is not available on all
-          * databases, and TIME is stored with second precision in ANSI SQL, instead of the millisecond
-          * one in the [[OffsetTime]] class.
-          */
-        java.sql.Types.VARCHAR
-      }
+    class LegacyOffsetTimeJdbcType extends OffsetTimeJdbcType {
+      override def sqlType : Int = java.sql.Types.VARCHAR
       override def setValue(v: OffsetTime, p: PreparedStatement, idx: Int) : Unit = {
         p.setString(idx, v.toString)
       }
@@ -318,18 +515,8 @@ trait JdbcTypesComponent extends RelationalTypesComponent { self: JdbcProfile =>
       }
     }
 
-    class OffsetDateTimeJdbcType extends DriverJdbcType[OffsetDateTime] {
-      override def sqlType : Int = {
-        /**
-          * Stores the [[OffsetDateTime]] as a 'VARCHAR' in databases with no specific
-          * 'TIMESTAMP WITH OFFSET' implementations, like SQLite. It's implemented in this
-          * way because almost any database support 'TIMESTAMP WITH OFFSET' by default,
-          * and the ones supporting it do not have an standardized implementation.
-          *
-          * A persisted value would be '2015-10-01T12:57:20.293+02:00'.
-          */
-        java.sql.Types.VARCHAR
-      }
+    class LegacyOffsetDateTimeJdbcType extends OffsetDateTimeJdbcType {
+      override def sqlType : Int = java.sql.Types.VARCHAR
       override def setValue(v: OffsetDateTime, p: PreparedStatement, idx: Int): Unit = {
         p.setString(idx, v.toString)
       }
@@ -347,18 +534,8 @@ trait JdbcTypesComponent extends RelationalTypesComponent { self: JdbcProfile =>
       }
     }
 
-    class ZonedDateTimeJdbcType extends DriverJdbcType[ZonedDateTime] {
-      override def sqlType : Int = {
-        /**
-          * Stores the [[ZonedDateTime]] as a 'VARCHAR' in databases with no specific
-          * 'TIMESTAMP WITH TIMEZONE' implementation, like SQLite. It's implemented in this
-          * way because almost any database support 'TIMESTAMP WITH OFFSET' by default,
-          * and the ones supporting it do not have an standardized implementation.
-          *
-          * A persisted value would be '2015-09-30T17:20:29.393+02:00[Europe/Madrid]'
-          */
-        java.sql.Types.VARCHAR
-      }
+    class LegacyZonedDateTimeJdbcType extends ZonedDateTimeJdbcType {
+      override def sqlType : Int = java.sql.Types.VARCHAR
       override def setValue(v: ZonedDateTime, p: PreparedStatement, idx: Int) : Unit = {
         p.setString(idx, v.toString)
       }
@@ -533,7 +710,69 @@ trait JdbcTypesComponent extends RelationalTypesComponent { self: JdbcProfile =>
   }
 }
 
+/** Text formats of the java.time values that Slick binds or stores as strings */
+private[jdbc] object JavaTimeFormats {
+  private val time9 = DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSSSSS")
+
+  /** `HH:mm:ss` with only as many fractional digits as needed. It is canonical and sorts in time order. */
+  val localTime: DateTimeFormatter =
+    new DateTimeFormatterBuilder()
+      .appendPattern("HH:mm:ss")
+      .optionalStart()
+      .appendFraction(ChronoField.NANO_OF_SECOND, 0, 9, true)
+      .optionalEnd()
+      .toFormatter()
+
+  /** `yyyy-MM-dd HH:mm:ss.nnnnnnnnn` */
+  val localDateTime: DateTimeFormatter =
+    new DateTimeFormatterBuilder()
+      .append(DateTimeFormatter.ISO_LOCAL_DATE)
+      .appendLiteral(' ')
+      .append(time9)
+      .toFormatter()
+
+  /** Reads a date and a time separated by a space or `T`, with or without seconds and fractional digits */
+  val localDateTimeParser: DateTimeFormatter =
+    new DateTimeFormatterBuilder()
+      .append(DateTimeFormatter.ISO_LOCAL_DATE)
+      .optionalStart().appendLiteral(' ').optionalEnd()
+      .optionalStart().appendLiteral('T').optionalEnd()
+      .append(DateTimeFormatter.ISO_LOCAL_TIME)
+      .toFormatter()
+
+  /** `HH:mm:ss.nnnnnnnnn+hh:mm` */
+  val offsetTime: DateTimeFormatter =
+    new DateTimeFormatterBuilder()
+      .append(time9)
+      .appendOffset("+HH:MM:ss", "+00:00")
+      .toFormatter()
+
+  /** `yyyy-MM-dd HH:mm:ss.nnnnnnnnn+hh:mm` */
+  val offsetDateTime: DateTimeFormatter =
+    new DateTimeFormatterBuilder()
+      .append(localDateTime)
+      .appendOffset("+HH:MM:ss", "+00:00")
+      .toFormatter()
+
+  /** `HH:mm:ss.nnnnnnnnnZ` for a time in UTC: fixed width, so that the text sorts in time order */
+  val utcTime: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSSSSS'Z'")
+
+  /** `yyyy-MM-ddTHH:mm:ss.nnnnnnnnnZ` for an instant, in UTC: fixed width (for years 0 to 9999), so that the
+    * text sorts in time order */
+  val utcDateTime: DateTimeFormatter =
+    new DateTimeFormatterBuilder()
+      .append(DateTimeFormatter.ISO_LOCAL_DATE)
+      .appendLiteral('T')
+      .append(utcTime)
+      .toFormatter()
+      .withZone(ZoneOffset.UTC)
+}
+
 object JdbcTypesComponent {
+  /** The values of the profile configuration key `javaTimeStorage` */
+  private[slick] val JavaTimeStorageNative = "native"
+  private[slick] val JavaTimeStorageText = "text"
+
   private[slick] lazy val typeNames = Map() ++
     (for(f <- classOf[java.sql.Types].getFields)
       yield f.get(null).asInstanceOf[Int] -> f.getName)

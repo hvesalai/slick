@@ -144,7 +144,42 @@ trait H2Profile extends JdbcProfile with JdbcActionComponent.MultipleRowsPerStat
       override def valueToSQLLiteral(value: UUID) = "'" + value + "'"
       override def hasLiteralForm = true
     }
-    override val instantType : InstantJdbcType = new InstantJdbcType {
+    override val localTimeType: LocalTimeJdbcType =
+      if (useTextJavaTimeStorage) new TextLocalTimeJdbcType else new H2LocalTimeJdbcType
+    override val localDateTimeType: LocalDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyLocalDateTimeJdbcType else new H2LocalDateTimeJdbcType
+    override val instantType: InstantJdbcType =
+      if (useTextJavaTimeStorage) new LegacyH2InstantJdbcType else new H2InstantJdbcType
+    override val offsetTimeType: OffsetTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyOffsetTimeJdbcType else new H2OffsetTimeJdbcType
+    override val offsetDateTimeType: OffsetDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyOffsetDateTimeJdbcType else new H2OffsetDateTimeJdbcType
+    override val zonedDateType: ZonedDateTimeJdbcType =
+      if (useTextJavaTimeStorage) new LegacyZonedDateTimeJdbcType else new H2ZonedDateTimeJdbcType
+
+    /* H2 keeps nanoseconds with a precision of 9. Its TIME has no fractional seconds by default. */
+    class H2LocalTimeJdbcType extends LocalTimeJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIME(9)"
+    }
+    class H2LocalDateTimeJdbcType extends LocalDateTimeJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP(9)"
+    }
+    /* Values stored with any offset (e.g. +03 or +05:30) are read back as the correct Instant (#2053, #2055) */
+    class H2InstantJdbcType extends InstantJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP(9) WITH TIME ZONE"
+    }
+    class H2OffsetTimeJdbcType extends OffsetTimeJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIME(9) WITH TIME ZONE"
+    }
+    class H2OffsetDateTimeJdbcType extends OffsetDateTimeJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP(9) WITH TIME ZONE"
+    }
+    /* H2 keeps the offset of a ZonedDateTime, but not its zone region */
+    class H2ZonedDateTimeJdbcType extends ZonedDateTimeJdbcType {
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP(9) WITH TIME ZONE"
+    }
+
+    class LegacyH2InstantJdbcType extends LegacyInstantJdbcType {
       override def sqlTypeName(sym: Option[FieldSymbol]) = "TIMESTAMP(9) WITH TIME ZONE"
 
       // Use the driver's native TIMESTAMP WITH TIME ZONE support so that values stored with any offset
