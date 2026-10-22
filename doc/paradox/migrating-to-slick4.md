@@ -79,6 +79,10 @@ only thing that changes is how you construct the database.
   instead of a result set (an insert, update, delete or DDL statement) now fails with a `SlickException`. In Slick 3
   it returned the update count cast to `R`. Use `sqlu"..."` or `.asUpdate` for such statements, also where
   `.as[Int]` or `.as[Unit]` was used.
+- **java.time column types:** `LocalTime`, `LocalDateTime`, `Instant`, `OffsetTime`, `OffsetDateTime` and
+  `ZonedDateTime` now use the database's own date and time types where it has them, instead of text on many
+  databases. Tables created by Slick 3 need to be migrated, or the profile setting `javaTimeStorage = text` keeps the
+  Slick 3 mappings. See [Date and Time Column Types](#java-time-column-types).
 - **`None` literals in a select list:** these are now written as `cast(null as <type>)` with the SQL type of the
   literal's column type (except on MySQL and Oracle). If you map a `String` onto a PostgreSQL column of a custom type
   such as an enum or `jsonb`, a `None` literal of it is now cast to `VARCHAR`, and a union of it with that column
@@ -361,6 +365,184 @@ db.stream(blobQuery.result)   // demand-driven by default
 
 If you want to migrate to Cats Effect 3 or ZIO in the future, Slick 4 supports both natively.
 See @ref:[Database](database.md) for the `slick.cats.Database` and `slick.zio.Database` APIs.
+
+---
+
+## 9. Date and Time Column Types { #java-time-column-types }
+
+Slick 4 stores the java.time types in the database's own date and time types wherever the database has one (see
+@ref:[Date and Time types](datetimetypes.md) for the full table). Slick 3 stored many of them as text, and bound some
+through `java.sql.Timestamp` in the JVM's time zone. This affects you if your tables were created by Slick 3 (or to
+match its DDL) and have columns of these types. `LocalDate` and `java.sql` types are not affected.
+
+You have two options:
+
+1. **Keep the Slick 3 mappings** for now: set `javaTimeStorage = text` for your profile, e.g.
+
+    ```
+    slick.jdbc.MySQLProfile.javaTimeStorage = text
+    ```
+
+    This uses exactly the column types, binding and literals of Slick 3 for all seven types.
+
+2. **Migrate the columns** with the statements below, then use the default (`native`). Run them in a transaction or
+   with a backup; the examples use a table `t` with a column of each type (`lt` LocalTime, `ldt` LocalDateTime,
+   `i` Instant, `ot` OffsetTime, `odt` OffsetDateTime, `zdt` ZonedDateTime), all `NOT NULL`. Adapt the
+   `NOT NULL`/`NULL` and names to your tables. They were run against MySQL 9.6, PostgreSQL 18, SQL Server 2025,
+   Oracle 23, DB2 11.5, H2 2.5 and HSQLDB 2.7, with data written by Slick 3.
+
+Where a type stays text but its format changed (the offset types are now normalized to UTC with a fixed width, so that
+they sort correctly), Slick 4 still reads the old values, but they do not sort or compare correctly against new ones
+until they are rewritten. Rewrite them by reading and updating them through Slick, e.g.
+`t.map(r => (r.id, r.ot)).result.flatMap(rows => DBIO.seq(rows.map { case (id, ot) => t.filter(_.id === id).map(_.ot).update(ot) }*))`.
+
+### MySQL
+
+`LocalTime`, `LocalDateTime`, `Instant`, `OffsetDateTime` and `ZonedDateTime` change from `TEXT` (or `VARCHAR(254)`)
+to `TIME(6)`, `DATETIME(6)` and `TIMESTAMP(6)`. MySQL does not accept a `Z`, a zone region, or an offset without
+seconds, so those are fixed first. The offsets make the conversion independent of the session time zone. `OffsetTime`
+stays text (rewrite it as described above). Instants must be between 1970 and 2038. Configure the connection's
+session time zone as described in @ref:[Date and Time types](datetimetypes.md#mysql).
+
+```sql
+UPDATE t SET
+  i = REPLACE(i, 'Z', '+00:00'),
+  odt = REGEXP_REPLACE(REPLACE(odt, 'Z', '+00:00'), '^([^T]*T[0-9]{2}:[0-9]{2})([+-])', '$1:00$2'),
+  zdt = REGEXP_REPLACE(REPLACE(SUBSTRING_INDEX(zdt, '[', 1), 'Z', '+00:00'), '^([^T]*T[0-9]{2}:[0-9]{2})([+-])', '$1:00$2');
+ALTER TABLE t
+  MODIFY lt TIME(6) NOT NULL,
+  MODIFY ldt DATETIME(6) NOT NULL,
+  MODIFY i TIMESTAMP(6) NOT NULL,
+  MODIFY odt TIMESTAMP(6) NOT NULL,
+  MODIFY zdt TIMESTAMP(6) NOT NULL;
+```
+
+A nullable `TIMESTAMP(6)` column must be declared `NULL` (e.g. `MODIFY i TIMESTAMP(6) NULL`).
+
+### PostgreSQL
+
+`Instant` changes from `timestamp` (holding the UTC date and time) to `timestamptz`, and `OffsetDateTime` and
+`ZonedDateTime` from `VARCHAR` to `timestamptz`. `TIME` and `TIMESTAMP` become `TIME(6)` and `TIMESTAMP(6)`, which
+is the same type, so that change is optional. `OffsetTime` is unchanged.
+
+```sql
+ALTER TABLE t
+  ALTER COLUMN i TYPE TIMESTAMPTZ USING i AT TIME ZONE 'UTC',
+  ALTER COLUMN odt TYPE TIMESTAMPTZ USING odt::timestamptz,
+  ALTER COLUMN zdt TYPE TIMESTAMPTZ USING regexp_replace(zdt, '\[.*\]$', '')::timestamptz;
+```
+
+### SQL Server
+
+`ZonedDateTime` changes from `VARCHAR(MAX)` to `DATETIMEOFFSET(7)`. The precision of `TIME`, `DATETIME2` and
+`DATETIMEOFFSET` goes from 6 to 7 (optional). `OffsetTime` stays text (rewrite it as described above).
+
+```sql
+-- remove the zone region, add missing seconds and keep at most 7 fractional digits
+UPDATE t SET zdt = LEFT(zdt, CHARINDEX('[', zdt + '[') - 1);
+UPDATE t SET zdt = STUFF(zdt, 17, 0, ':00') WHERE SUBSTRING(zdt, 17, 1) <> ':';
+UPDATE t SET zdt = STUFF(zdt, 28, PATINDEX('%[^0-9]%', SUBSTRING(zdt, 28, 20) + 'x') - 1, '')
+  WHERE SUBSTRING(zdt, 20, 1) = '.' AND PATINDEX('%[^0-9]%', SUBSTRING(zdt, 21, 20) + 'x') > 8;
+ALTER TABLE t ALTER COLUMN zdt DATETIMEOFFSET(7) NOT NULL;
+-- optional
+ALTER TABLE t ALTER COLUMN lt TIME(7) NOT NULL;
+ALTER TABLE t ALTER COLUMN ldt DATETIME2(7) NOT NULL;
+ALTER TABLE t ALTER COLUMN i DATETIMEOFFSET(7) NOT NULL;
+ALTER TABLE t ALTER COLUMN odt DATETIMEOFFSET(7) NOT NULL;
+```
+
+### Oracle
+
+`Instant` changes from `TIMESTAMP(9)` to `TIMESTAMP(9) WITH TIME ZONE`. Slick 3 wrote it in the application's JVM
+time zone (not in UTC), so use that zone (`Europe/Helsinki` below). `OffsetDateTime` and `ZonedDateTime` change from
+`VARCHAR2(254)` to `TIMESTAMP(9) WITH TIME ZONE` (a `ZonedDateTime` keeps its zone region). `LocalDateTime` goes
+from `TIMESTAMP` (6 digits) to `TIMESTAMP(9)`. Such a column cannot be part of a primary key.
+
+```sql
+ALTER TABLE t MODIFY (ldt TIMESTAMP(9));
+ALTER TABLE t ADD (i_tz TIMESTAMP(9) WITH TIME ZONE);
+UPDATE t SET i_tz = FROM_TZ(i, 'Europe/Helsinki');
+ALTER TABLE t DROP COLUMN i;
+ALTER TABLE t RENAME COLUMN i_tz TO i;
+ALTER TABLE t MODIFY (i NOT NULL);
+ALTER TABLE t ADD (odt_tz TIMESTAMP(9) WITH TIME ZONE, zdt_tz TIMESTAMP(9) WITH TIME ZONE);
+UPDATE t SET
+  odt_tz = TO_TIMESTAMP_TZ(REGEXP_REPLACE(REPLACE(odt, 'Z', '+00:00'), '^(.{16})([+-])', '\1:00\2'),
+    'YYYY-MM-DD"T"HH24:MI:SS.FF9TZH:TZM'),
+  zdt_tz = TO_TIMESTAMP_TZ(REGEXP_REPLACE(REGEXP_REPLACE(REPLACE(zdt, 'Z[', '+00:00['), '\[.*\]$', ''),
+    '^(.{16})([+-])', '\1:00\2'), 'YYYY-MM-DD"T"HH24:MI:SS.FF9TZH:TZM')
+    AT TIME ZONE REGEXP_SUBSTR(zdt, '\[(.*)\]$', 1, 1, NULL, 1);
+ALTER TABLE t DROP (odt, zdt);
+ALTER TABLE t RENAME COLUMN odt_tz TO odt;
+ALTER TABLE t RENAME COLUMN zdt_tz TO zdt;
+ALTER TABLE t MODIFY (odt NOT NULL, zdt NOT NULL);
+```
+
+### DB2
+
+`Instant`, `OffsetDateTime` and `ZonedDateTime` change from `VARCHAR(254)` to `TIMESTAMP(9)` holding the date and
+time in UTC; `LocalDateTime` from `TIMESTAMP` (6 digits) to `TIMESTAMP(9)`. `OffsetTime` stays text (rewrite it as
+described above).
+
+```sql
+ALTER TABLE t ALTER COLUMN ldt SET DATA TYPE TIMESTAMP(9);
+CALL SYSPROC.ADMIN_CMD('REORG TABLE t');
+-- the ISO text without the zone region, with +00:00 for Z, a space for T, and seconds
+UPDATE t SET
+  i = REGEXP_REPLACE(REPLACE(REPLACE(i, 'Z', '+00:00'), 'T', ' '), '^(.{16})([+-])', '\1:00\2'),
+  odt = REGEXP_REPLACE(REPLACE(REPLACE(odt, 'Z', '+00:00'), 'T', ' '), '^(.{16})([+-])', '\1:00\2'),
+  zdt = REGEXP_REPLACE(REPLACE(REPLACE(REGEXP_REPLACE(zdt, '\[.*\]$', ''), 'Z', '+00:00'), 'T', ' '),
+    '^(.{16})([+-])', '\1:00\2');
+-- the date and time in UTC: the local part minus the offset
+ALTER TABLE t ADD COLUMN i_utc TIMESTAMP(9) ADD COLUMN odt_utc TIMESTAMP(9) ADD COLUMN zdt_utc TIMESTAMP(9);
+UPDATE t SET
+  i_utc = TIMESTAMP(LEFT(i, LENGTH(i) - 6), 9),
+  odt_utc = TIMESTAMP(LEFT(odt, LENGTH(odt) - 6), 9) - ((CASE WHEN SUBSTR(odt, LENGTH(odt) - 5, 1) = '-' THEN -1 ELSE 1 END)
+    * (INTEGER(SUBSTR(odt, LENGTH(odt) - 4, 2)) * 60 + INTEGER(SUBSTR(odt, LENGTH(odt) - 1, 2)))) MINUTES,
+  zdt_utc = TIMESTAMP(LEFT(zdt, LENGTH(zdt) - 6), 9) - ((CASE WHEN SUBSTR(zdt, LENGTH(zdt) - 5, 1) = '-' THEN -1 ELSE 1 END)
+    * (INTEGER(SUBSTR(zdt, LENGTH(zdt) - 4, 2)) * 60 + INTEGER(SUBSTR(zdt, LENGTH(zdt) - 1, 2)))) MINUTES;
+ALTER TABLE t DROP COLUMN i DROP COLUMN odt DROP COLUMN zdt;
+CALL SYSPROC.ADMIN_CMD('REORG TABLE t');
+ALTER TABLE t RENAME COLUMN i_utc TO i;
+ALTER TABLE t RENAME COLUMN odt_utc TO odt;
+ALTER TABLE t RENAME COLUMN zdt_utc TO zdt;
+ALTER TABLE t ALTER COLUMN i SET NOT NULL ALTER COLUMN odt SET NOT NULL ALTER COLUMN zdt SET NOT NULL;
+CALL SYSPROC.ADMIN_CMD('REORG TABLE t');
+```
+
+### H2
+
+`LocalTime`, `OffsetTime`, `OffsetDateTime` and `ZonedDateTime` change from `VARCHAR` to `TIME(9)`,
+`TIME(9) WITH TIME ZONE` and `TIMESTAMP(9) WITH TIME ZONE`; `LocalDateTime` from `TIMESTAMP` to `TIMESTAMP(9)`.
+`Instant` is unchanged.
+
+```sql
+UPDATE t SET odt = REGEXP_REPLACE(odt, '^(.{16})([+-]|Z)', '$1:00$2'),
+  zdt = REGEXP_REPLACE(REGEXP_REPLACE(zdt, '\[.*\]$', ''), '^(.{16})([+-]|Z)', '$1:00$2');
+ALTER TABLE t ALTER COLUMN lt SET DATA TYPE TIME(9);
+ALTER TABLE t ALTER COLUMN ldt SET DATA TYPE TIMESTAMP(9);
+ALTER TABLE t ALTER COLUMN ot SET DATA TYPE TIME(9) WITH TIME ZONE;
+ALTER TABLE t ALTER COLUMN odt SET DATA TYPE TIMESTAMP(9) WITH TIME ZONE;
+ALTER TABLE t ALTER COLUMN zdt SET DATA TYPE TIMESTAMP(9) WITH TIME ZONE;
+```
+
+### HSQLDB
+
+`ZonedDateTime` changes from `LONGVARCHAR` to `TIMESTAMP(9) WITH TIME ZONE`, `LocalTime` from `TIME(3)` to `TIME(9)`
+and `LocalDateTime` from `TIMESTAMP` to `TIMESTAMP(9)`. The other types are unchanged.
+
+```sql
+UPDATE t SET zdt = REGEXP_REPLACE(REGEXP_REPLACE(REPLACE(REGEXP_REPLACE(zdt, '\[.*\]$', ''), 'Z', '+00:00'), 'T', ' '),
+  '^(.{16})([+-])', '$1:00$2');
+ALTER TABLE t ALTER COLUMN lt SET DATA TYPE TIME(9);
+ALTER TABLE t ALTER COLUMN ldt SET DATA TYPE TIMESTAMP(9);
+ALTER TABLE t ALTER COLUMN zdt SET DATA TYPE TIMESTAMP(9) WITH TIME ZONE;
+```
+
+### Derby and SQLite
+
+The column types do not change. The offset types (`OffsetTime`, `OffsetDateTime`, `ZonedDateTime`, and `Instant` on
+Derby) are stored in a new text format; rewrite them as described above.
 
 ---
 

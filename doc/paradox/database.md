@@ -73,7 +73,8 @@ SQLite has no dedicated date and time storage classes. The sqlite-jdbc driver st
 `LocalDateTime` and `Instant` through these types, so they are stored in the same way. `LocalDate` and
 `LocalDateTime` values are converted using the JVM's default time zone, so for example
 `LocalDate.of(2020, 1, 2)` is stored as midnight of that day in that zone. `LocalTime`, `OffsetTime`,
-`OffsetDateTime` and `ZonedDateTime` are stored as ISO-8601 TEXT instead (see @ref:[Date and Time types](datetimetypes.md)).
+`OffsetDateTime` and `ZonedDateTime` are stored as ISO-8601 TEXT instead, the last three normalized to UTC (see
+@ref:[Date and Time types](datetimetypes.md)).
 
 SQLite's own date and time functions (`date`, `time`, `datetime`, `julianday`, `strftime`, `unixepoch`)
 expect ISO-8601 text, Julian day numbers, or Unix time in **seconds**, so they cannot use the millisecond
